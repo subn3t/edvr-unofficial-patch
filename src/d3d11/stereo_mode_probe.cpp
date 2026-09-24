@@ -673,6 +673,11 @@ uint8_t* g_stereoStub = nullptr;
 volatile uint8_t* g_stereoData = nullptr;  // +0 flag, +4 substitutions
 bool g_stereoTried = false, g_stereoPatched = false;
 uint32_t g_stereoLastCount = 0;
+// Frame boundaries since the stub last put a 3 where the game asked for 5.
+// The game asks for 5 every frame it is on foot, so a count that moves is
+// the ENGINE saying on foot -- right from a load on foot, when the journal
+// still holds the last session's Embark (flight of 2026-09-24 15:36).
+uint32_t g_quietFrames = ~0u;
 bool g_swapWanted = false;
 
 void InstallStereoPatch() {
@@ -750,21 +755,27 @@ void InstallStereoPatch() {
 }
 
 void StereoFrame() {
-    // The eyes, crossed on foot in the first stereo flight: each image to the
-    // other eye while on foot with the stereo on.
-    setEyeSwap(g_stereoPatched && g_swapWanted && *g_stereoData && journalOnFootKnown() && journalOnFoot());
-    if (!g_stereoPatched) return;
+    if (!g_stereoPatched) {
+        setEyeSwap(false);
+        return;
+    }
     const uint32_t count = *reinterpret_cast<volatile const uint32_t*>(g_stereoData + 4);
     if (count && !g_stereoLastCount)
         Log::get().note("onfoot stereo: the game asked for HMD Cinema (5); kept at HMD stereo (3).");
+    if (count != g_stereoLastCount) g_quietFrames = 0;
+    else if (g_quietFrames != ~0u) ++g_quietFrames;
     g_stereoLastCount = count;
+    // Each image to the other eye (onfoot_stereo_swap_eyes) while on foot.
+    setEyeSwap(g_swapWanted && onFootStereoWanted());
 }
 
 }  // namespace
 
-bool onFootStereoWanted() {
-    return g_stereoPatched && g_stereoData && *g_stereoData && journalOnFootKnown() && journalOnFoot();
-}
+bool onFootStereoHolding() { return g_stereoPatched && g_stereoData && *g_stereoData; }
+
+// A few frames of grace, so one frame the store did not run is not a trip
+// to the ship and back.
+bool onFootStereoWanted() { return onFootStereoHolding() && g_quietFrames < 30; }
 
 void stereoModeProbeConfigure(Config& cfg) {
     const bool stereo = cfg.getBool("experimental.onfoot_stereo", false);
