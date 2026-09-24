@@ -29,4 +29,7 @@ void cameraHuntConfigure(Config& cfg);
 // the frame had none.
 void cameraHuntFrame(const float* raw12);
 
+// While it holds the debug registers (hw_watch.h has one user at a time).
+bool cameraHuntWatching();
+
 }  // namespace edvr

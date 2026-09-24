@@ -10,20 +10,22 @@ namespace {
 
 uintptr_t g_addr[3] = {};
 uint8_t g_len[3] = {};
+bool g_reads[3] = {};
 DWORD g_armedTids[512];
 int g_armedTidCount = 0;
 
 // Dr7 LEN encoding: 00 one byte, 01 two, 11 four, 10 eight.
 DWORD64 LenBits(uint8_t len) { return len == 8 ? 2 : (len == 4 ? 3 : (len == 2 ? 1 : 0)); }
 
-// Dr7 for slots 1..3: local enable (bit 2i), RW = 01 (write) at 16+4i, LEN
-// at 18+4i. Other bits pass through.
+// Dr7 for slots 1..3: local enable (bit 2i), RW at 16+4i (01 writes, 11
+// reads and writes), LEN at 18+4i. Other bits pass through.
 DWORD64 ComposeDr7(DWORD64 dr7, bool arm) {
     for (int i = 1; i <= 3; ++i) {
         dr7 &= ~(DWORD64(1) << (2 * i));
         dr7 &= ~(DWORD64(0xF) << (16 + 4 * i));
         if (arm && g_addr[i - 1])
-            dr7 |= (DWORD64(1) << (2 * i)) | (DWORD64(1) << (16 + 4 * i)) | (LenBits(g_len[i - 1]) << (18 + 4 * i));
+            dr7 |= (DWORD64(1) << (2 * i)) | (DWORD64(g_reads[i - 1] ? 3 : 1) << (16 + 4 * i)) |
+                   (LenBits(g_len[i - 1]) << (18 + 4 * i));
     }
     return dr7;
 }
@@ -98,11 +100,12 @@ void hwWatchSweep() {
     CloseHandle(snap);
 }
 
-int hwWatchArm(const uintptr_t addr[3], const uint8_t len[3]) {
+int hwWatchArm(const uintptr_t addr[3], const uint8_t len[3], const bool reads[3]) {
     hwWatchDisarm();
     for (int i = 0; i < 3; ++i) {
         g_addr[i] = addr[i];
         g_len[i] = len[i];
+        g_reads[i] = reads && reads[i];
     }
     hwWatchSweep();
     return g_armedTidCount;

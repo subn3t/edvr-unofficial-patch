@@ -726,6 +726,60 @@ void StereoFrame() {
     setEyeSwap(g_swapWanted && onFootStereoWanted());
 }
 
+// --- on foot: aiming down sights without the zoom ---------------------------
+//
+// The camera hunt (flight of 2026-09-24 17:34) led to the on-foot camera's
+// update, +0x1073830. Each frame it takes its state from its parent (the
+// field of view first: pi/2 at HumanoidFOV 90), the pose from the camera
+// entity, then, while the aim component's blend (vf+0x100) is above 0, pulls
+// the field of view toward the weapon's zoom (degrees at [rsi+14h]):
+//
+//     +0x10739C8  0F 57 C9   xorps  xmm1,xmm1
+//     +0x10739CB  0F 2F C1   comiss xmm0,xmm1      ; the blend against 0
+//     +0x10739CE  76 7E      jbe    +0x1073A4E     ; 0: no zoom
+//
+// In a headset the world is already at its true size; the zoom narrows it to
+// a window (the "blinders"), and the HUD and view model shrink with it.
+// With experimental.onfoot_stereo on, experimental.onfoot_ads_zoom 0 (the
+// default) makes that jbe a jmp (EB): the gun still
+// comes up to the eye, the world stays put. One byte, so a thread sees the
+// old instruction or the new one; live both ways.
+constexpr uintptr_t kZoomRva = 0x10739C8u;
+constexpr uint8_t kZoomBytes[10] = {0x0F, 0x57, 0xC9, 0x0F, 0x2F, 0xC1, 0x76, 0x7E, 0x48, 0x8B};
+constexpr int kZoomJump = 6;
+int g_zoomState = -1;  // -1 untried, 0 the game's, 1 no zoom, 2 not this build
+
+void ApplyAdsZoom(bool zoom) {
+    if (g_zoomState == 2 || g_zoomState == (zoom ? 0 : 1)) return;
+    if (!g_base) g_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    uint8_t* site = reinterpret_cast<uint8_t*>(g_base + kZoomRva);
+    uint8_t now[sizeof(kZoomBytes)];
+    if (!sehCopy(now, reinterpret_cast<uintptr_t>(site), sizeof(now))) {
+        g_zoomState = 2;
+        return;
+    }
+    now[kZoomJump] = now[kZoomJump] == 0xEB ? 0x76 : now[kZoomJump];
+    if (std::memcmp(now, kZoomBytes, sizeof(kZoomBytes)) != 0) {
+        g_zoomState = 2;
+        Log::get().note("onfoot ADS: the zoom's bytes are not the expected ones; left as the game has it.");
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(site + kZoomJump, 1, PAGE_EXECUTE_READWRITE, &old)) {
+        g_zoomState = 2;
+        Log::get().note("onfoot ADS: the game's code page could not be made writable; zoom left as it is.");
+        return;
+    }
+    *reinterpret_cast<volatile uint8_t*>(site + kZoomJump) = zoom ? 0x76 : 0xEB;
+    DWORD ignored = 0;
+    VirtualProtect(site + kZoomJump, 1, old, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), site + kZoomJump, 1);
+    if (g_zoomState != -1 || !zoom)
+        Log::get().note(zoom ? "onfoot ADS: the game's zoom (live)."
+                             : "onfoot ADS: no zoom (live): aiming brings the gun up; the world keeps its size.");
+    g_zoomState = zoom ? 0 : 1;
+}
+
 }  // namespace
 
 bool onFootStereoHolding() { return g_stereoPatched && g_stereoData && *g_stereoData; }
@@ -744,6 +798,9 @@ void stereoModeProbeConfigure(Config& cfg) {
         *g_stereoData = want;
     }
     g_watchWanted = cfg.getBool("experimental.stereo_mode_watch", false);
+    // Only with the on-foot stereo: without it the game's flat view is on a
+    // panel, where its zoom is what it always was.
+    ApplyAdsZoom(!stereo || cfg.getBool("experimental.onfoot_ads_zoom", false));
     const bool kick = cfg.getBool("experimental.onfoot_stereo_kick", true);
     if (kick != g_kickWanted) Log::get().note("onfoot stereo: load-in kick %s.", kick ? "on" : "off");
     g_kickWanted = kick;
