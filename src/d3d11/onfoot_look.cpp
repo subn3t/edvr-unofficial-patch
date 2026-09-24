@@ -124,7 +124,7 @@ bool Skipped(Part p) { return (g_skip & p) != 0; }
 uint64_t g_frames = 0, g_panelFrames = 0, g_scanned = 0;
 uint64_t g_turnedView = 0, g_turnedClip = 0, g_turnedOthers = 0, g_otherViews = 0, g_noPose = 0, g_offCentre = 0;
 uint64_t g_anyFrame = 0, g_scaled = 0, g_masks = 0, g_pendingFull = 0, g_ambiguous = 0;
-uint64_t g_lockDrawn = 0, g_lockDeclined = 0, g_lockWarped = 0, g_hudScaled = 0;
+uint64_t g_lockDrawn = 0, g_lockDeclined = 0, g_lockWarped = 0, g_hudScaled = 0, g_modelMatched = 0;
 double g_lockWarpMaxDeg = 0;
 float g_hudScale = 1.0f;  // experimental.onfoot_hud_scale
 bool g_matchFov = true;   // experimental.onfoot_match_fov
@@ -335,50 +335,72 @@ bool TurnSameCamera(float* rows) {
     return true;
 }
 
-// The helmet HUD's view (experimental.onfoot_hud_scale): the main view's
-// aspect, a narrower field (larger x scale) and its own near plane (0.0675,
-// 0.1). Its x and y clip rows scaled by k draw the HUD k times its size about
-// the centre -- with the head-locked view the panel's corners sit at the edge
-// of the headset's field.
-bool ScaleHud(float* rows) {
-    if (g_hudScale == 1.0f || !g_haveMain || !g_panelLastFrame || !g_mainCentred) return false;
-    if (onFootStereoHolding() && !onFootStereoWanted()) return false;
-    const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
-    if (sy < 1e-6 || !Near(sw, 1, 1e-3) || sx < 1.1 * g_mainScale[0]) return false;
-    const double aspect = g_mainScale[0] / g_mainScale[1];
-    if (!Near(sx / sy, aspect, 5e-3 * aspect) || Near(rows[11], g_mainNear, 0.02 * g_mainNear)) return false;
-    for (int i = 0; i < 8; ++i) rows[i] *= g_hudScale;
-    ++g_hudScaled;
+// A perspective's z row: (0, 0, 0, near) for the world's infinite far
+// plane, or a * forward + (0, 0, 0, b) for a finite one -- the HUD pass's
+// (near 0.27 or 0.1, far about 1000). False for anything else.
+bool PerspectiveZ(const float* rows, bool* finite) {
+    const float* z = rows + 8;
+    if (z[3] <= 0) return false;
+    const double zl = RowLength(z);
+    *finite = zl > 1e-7;
+    if (!*finite) return true;
+    const double wl = RowLength(rows + 12);
+    if (wl < 1e-6) return false;
+    const double a = (double(z[0]) * rows[12] + double(z[1]) * rows[13] + double(z[2]) * rows[14]) / (wl * wl);
+    for (int k = 0; k < 3; ++k)
+        if (std::fabs(z[k] - a * rows[12 + k]) > 1e-3 * zl) return false;
     return true;
 }
 
-// THE VIEW MODEL (experimental.onfoot_match_fov). The first-person body,
-// what it holds and the helmet HUD are drawn from the camera through
-// narrower projections than the world's -- at the hip x 1.294 against the
-// world's 0.5625 at the widest FOV setting, aiming down sights 2.10 against
-// 1.15 (the censuses of 2026-09-24) -- so on a flat screen they look bigger
-// and nearer than they are. In the headset the world is 1:1, so they are
-// drawn through the world's projection: their x and y rows scaled by the
-// world's x scale over theirs, then by onfoot_hud_scale (1: as the world).
-// The field set by eye before this was found, hud_scale 0.5, was 0.435's
-// approximation.
+// A clip transform's rows (by rows) whose axes are the identity's: a write
+// in view space, taken before the head's turn.
+bool ViewSpaceRows(const float* rows) {
+    const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
+    if (sx < 1e-6 || sy < 1e-6 || sw < 1e-6) return false;
+    return std::fabs(rows[0] / sx - 1) < 1e-4 && std::fabs(rows[5] / sy - 1) < 1e-4 && std::fabs(rows[14] / sw - 1) < 1e-4;
+}
+
+// THE VIEW MODEL AND THE HUD (the censuses of 2026-09-24), two kinds of view
+// of the camera the world is not drawn through, rows as the game wrote them.
+//
+// The view model -- the first-person body and what it holds, drawn into the
+// G-buffer in the world's axes -- through a narrower projection than the
+// world's: x 1.294 against 0.5625 at the hip and the widest FOV setting,
+// 2.10 against 1.15 aiming, so on a flat screen it looks bigger and nearer
+// than it is. In the headset the world is 1:1, so with
+// experimental.onfoot_match_fov the view model is drawn through the world's
+// projection: x and y rows scaled by the world's x scale over its own.
+//
+// The HUD pass -- health, the compass, the ammo readout -- in view space
+// with a finite far plane, drawn after the scene into each eye's final. A
+// flat overlay laid out for the screen, whose corners at the widest field
+// sit at the edge of sight: experimental.onfoot_hud_scale scales it about
+// the centre (0.5 half). The first build to match the field scaled both by
+// hud_scale and missed the HUD (its finite far plane): the hands stretched,
+// the HUD stayed at the edges.
 bool MatchFov(float* rows) {
-    if (!g_matchFov) return ScaleHud(rows);
     if (!g_haveMain || !g_panelLastFrame || !g_mainCentred) return false;
     if (onFootStereoHolding() && !onFootStereoWanted()) return false;
     const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
     if (sx < 1e-6 || sy < 1e-6 || sw < 1e-6) return false;
     const double aspect = g_mainScale[0] / g_mainScale[1];
     if (!Near(sx / sy, aspect, 5e-3 * aspect)) return false;
-    if (std::fabs(rows[8]) > 1e-4 || std::fabs(rows[9]) > 1e-4 || std::fabs(rows[10]) > 1e-4 || rows[11] <= 0)
-        return false;
-    const double sxn = sx / sw;
-    if (sxn < 1.02 * g_mainScale[0]) return false;
+    bool finite = false;
+    if (!PerspectiveZ(rows, &finite)) return false;
     const double dot = double(rows[0]) * rows[12] + double(rows[1]) * rows[13] + double(rows[2]) * rows[14];
     if (std::fabs(dot) > 1e-3 * sx * sw) return false;
-    const double k = g_mainScale[0] / sxn * g_hudScale;
+    double k;
+    if (finite && ViewSpaceRows(rows)) {
+        if (g_hudScale == 1.0f) return false;
+        k = g_hudScale;
+        ++g_hudScaled;
+    } else {
+        const double sxn = sx / sw;
+        if (!g_matchFov || sxn < 1.02 * g_mainScale[0]) return false;
+        k = g_mainScale[0] / sxn;
+        ++g_modelMatched;
+    }
     for (int i = 0; i < 8; ++i) rows[i] = static_cast<float>(rows[i] * k);
-    ++g_hudScaled;
     return true;
 }
 
@@ -691,7 +713,7 @@ void Report() {
                     "left alone); copies turned: %llu in any frame, %llu scaled, %llu shadow masks, in "
                     "%llu scanned writes (%llu missed, every pending slot taken); %llu without a head pose, %llu "
                     "off-centre, %llu frames with the identity camera; head-locked view: %llu drawn, %llu declined%s%s%s, "
-                    "%llu timewarped (largest %.2f degrees); %llu view-model views matched to the world's field; "
+                    "%llu timewarped (largest %.2f degrees); %llu view-model views matched to the world's field, %llu HUD views scaled; "
                     "stereo: %s, %llu camera writes moved (%llu in view space, x%.2f), %llu written again for the other eye (%llu failed, %llu "
                     "not discards), %llu new eye targets, left eye = %s pipeline%s, half IPD %.2f mm; "
                     "head yaw %.1f pitch %.1f roll %.1f.",
@@ -699,7 +721,7 @@ void Report() {
                     U(g_otherViews), U(g_anyFrame), U(g_scaled), U(g_masks), U(g_scanned),
                     U(g_pendingFull), U(g_noPose), U(g_offCentre), U(g_ambiguous), U(g_lockDrawn), U(g_lockDeclined),
                     g_lockDeclined ? " (last: " : "", g_lockDeclined ? g_lockWhy : "", g_lockDeclined ? ")" : "",
-                    U(g_lockWarped), g_lockWarpMaxDeg, U(g_hudScaled), g_stereoOn ? "on" : "off", U(g_moved), U(g_movedNear), g_nearEye,
+                    U(g_lockWarped), g_lockWarpMaxDeg, U(g_modelMatched), U(g_hudScaled), g_stereoOn ? "on" : "off", U(g_moved), U(g_movedNear), g_nearEye,
                     U(g_rewrites), U(g_rewriteFails), U(g_notDiscard), U(g_newTargets),
                     g_leftPipe == 0 ? "first" : "second", g_leftKnown ? "" : " (assumed)", g_halfIpd * 1000,
                     g_lastYaw, g_lastPitch,
@@ -707,7 +729,7 @@ void Report() {
     g_frames = g_panelFrames = g_turnedView = g_turnedClip = g_turnedOthers = g_otherViews = 0;
     g_anyFrame = g_scaled = g_masks = g_scanned = g_pendingFull = 0;
     g_noPose = g_offCentre = g_ambiguous = 0;
-    g_lockDrawn = g_lockDeclined = g_lockWarped = g_hudScaled = 0;
+    g_lockDrawn = g_lockDeclined = g_lockWarped = g_hudScaled = g_modelMatched = 0;
     g_moved = g_movedNear = g_rewrites = g_rewriteFails = g_notDiscard = g_newTargets = 0;
     g_lockWarpMaxDeg = 0;
 }
@@ -1028,20 +1050,12 @@ double MoveScale(const float* rows) {
     if (sx < 1e-6 || sy < 1e-6 || sw < 1e-6) return 0;
     const double aspect = g_mainScale[0] / g_mainScale[1];
     if (!Near(sx / sy, aspect, 5e-3 * aspect)) return 0;
-    if (std::fabs(rows[8]) > 1e-4 || std::fabs(rows[9]) > 1e-4 || std::fabs(rows[10]) > 1e-4 || rows[11] <= 0)
-        return 0;
+    bool finite = false;
+    if (!PerspectiveZ(rows, &finite)) return 0;
     if (Skipped(kPartHudEye) && !Near(rows[11], g_mainNear, 0.02 * g_mainNear)) return 0;
     const double dot = double(rows[0]) * rows[12] + double(rows[1]) * rows[13] + double(rows[2]) * rows[14];
     if (std::fabs(dot) > 1e-3 * sx * sw) return 0;
     return sx / sw;
-}
-
-// A clip transform's rows (by rows) whose axes are the identity's: a write
-// in view space, taken before the head's turn.
-bool ViewSpaceRows(const float* rows) {
-    const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
-    if (sx < 1e-6 || sy < 1e-6 || sw < 1e-6) return false;
-    return std::fabs(rows[0] / sx - 1) < 1e-4 && std::fabs(rows[5] / sy - 1) < 1e-4 && std::fabs(rows[14] / sw - 1) < 1e-4;
 }
 
 int PredictPipe() { return g_curPipe >= 0 ? g_curPipe : (g_lastPipe >= 0 ? g_lastPipe : 0); }
@@ -1333,12 +1347,12 @@ void onFootLookConfigure(Config& cfg) {
     g_rtvGen = g_dsvGen = 0;
     const float hud = cfg.getFloat("experimental.onfoot_hud_scale", 1.0f);
     const float hudClamped = hud < 0.3f ? 0.3f : (hud > 1.5f ? 1.5f : hud);
-    if (hudClamped != g_hudScale) Log::get().note("onfoot look: helmet HUD drawn at %.2f of its size.", hudClamped);
+    if (hudClamped != g_hudScale) Log::get().note("onfoot look: the HUD drawn at %.2f of its size.", hudClamped);
     g_hudScale = hudClamped;
     const bool match = cfg.getBool("experimental.onfoot_match_fov", true);
     if (match != g_matchFov)
-        Log::get().note("onfoot look: the view model (body, gun, HUD) drawn %s.",
-                        match ? "through the world's projection" : "as the game draws it (onfoot_hud_scale scales it)");
+        Log::get().note("onfoot look: the view model (body, what it holds) drawn %s.",
+                        match ? "through the world's projection" : "as the game draws it");
     g_matchFov = match;
     const std::string skip = cfg.getString("experimental.onfoot_head_look_skip", "");
     unsigned mask = 0;
