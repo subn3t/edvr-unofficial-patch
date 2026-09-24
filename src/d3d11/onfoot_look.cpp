@@ -66,6 +66,7 @@ uint32_t g_lastGbufW = 0, g_lastGbufH = 0;
 // The head rotation for this frame's writes, in the game's view axes, taken
 // once per frame at the first turn.
 double g_q[3][3] = {};
+double g_hRender[3][3] = {};  // the same pose's rotation in OpenVR axes, for the head-locked view's timewarp
 bool g_qValid = false, g_qTaken = false;
 
 // The frame's camera rotation as the game wrote it (rows right, up, forward),
@@ -90,7 +91,7 @@ constexpr double kMatch = 1e-3;
 
 // Developer switches (experimental.onfoot_head_look_skip): parts of the turn
 // left out, to see by eye which one a visual fault follows. Live.
-enum Part : unsigned { kPartView = 1, kPartOthers = 2, kPartMask = 4, kPartFrames = 8, kPartScaled = 16 };
+enum Part : unsigned { kPartView = 1, kPartOthers = 2, kPartMask = 4, kPartFrames = 8, kPartScaled = 16, kPartTimewarp = 32 };
 unsigned g_skip = 0;
 bool Skipped(Part p) { return (g_skip & p) != 0; }
 
@@ -98,7 +99,9 @@ bool Skipped(Part p) { return (g_skip & p) != 0; }
 uint64_t g_frames = 0, g_panelFrames = 0, g_scanned = 0;
 uint64_t g_turnedView = 0, g_turnedClip = 0, g_turnedOthers = 0, g_otherViews = 0, g_noPose = 0, g_offCentre = 0;
 uint64_t g_anyFrame = 0, g_scaled = 0, g_masks = 0, g_pendingFull = 0, g_ambiguous = 0;
-uint64_t g_lockDrawn = 0, g_lockDeclined = 0;
+uint64_t g_lockDrawn = 0, g_lockDeclined = 0, g_lockWarped = 0, g_hudScaled = 0;
+double g_lockWarpMaxDeg = 0;
+float g_hudScale = 1.0f;  // experimental.onfoot_hud_scale
 const char* g_lockWhy = "";
 double g_lastYaw = 0, g_lastPitch = 0, g_lastRoll = 0;
 ULONGLONG g_lastReport = 0;
@@ -141,7 +144,10 @@ void TakeHeadRotation() {
     if (!g_qValid) return;
     const double s[3] = {1, 1, -1};
     for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j) g_q[i][j] = double(m[4 * i + j]) * s[i] * s[j];
+        for (int j = 0; j < 3; ++j) {
+            g_q[i][j] = double(m[4 * i + j]) * s[i] * s[j];
+            g_hRender[i][j] = m[4 * i + j];
+        }
     // For the report: yaw about y, pitch about x, roll about z (degrees).
     const double kDeg = 57.29577951308232;
     g_lastYaw = std::atan2(g_q[0][2], g_q[2][2]) * kDeg;
@@ -217,10 +223,26 @@ bool TurnSameCamera(float* rows) {
     return true;
 }
 
+// The helmet HUD's view (experimental.onfoot_hud_scale): the main view's
+// aspect, a narrower field (larger x scale) and its own near plane (0.0675,
+// 0.1). Its x and y clip rows scaled by k draw the HUD k times its size about
+// the centre -- with the head-locked view the panel's corners sit at the edge
+// of the headset's field.
+bool ScaleHud(float* rows) {
+    if (g_hudScale == 1.0f || !g_haveMain || !g_panelLastFrame) return false;
+    const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
+    if (sy < 1e-6 || !Near(sw, 1, 1e-3) || sx < 1.1 * g_mainScale[0]) return false;
+    const double aspect = g_mainScale[0] / g_mainScale[1];
+    if (!Near(sx / sy, aspect, 5e-3 * aspect) || Near(rows[11], g_mainNear, 0.02 * g_mainNear)) return false;
+    for (int i = 0; i < 8; ++i) rows[i] *= g_hudScale;
+    ++g_hudScaled;
+    return true;
+}
+
 // b0 at 64: the view's clip rows.
 void TurnView(float* a) {
     if (!IsMainView(a)) {
-        if (!TurnSameCamera(a)) ++g_otherViews;
+        if (!TurnSameCamera(a) && !ScaleHud(a)) ++g_otherViews;
         return;
     }
     if (Skipped(kPartView) || !Armed() || !RotateRows(a)) return;
@@ -259,7 +281,7 @@ bool TurnClip(float* c) {
     for (int r = 0; r < 4; ++r)
         for (int col = 0; col < 4; ++col) rows[4 * r + col] = c[4 * col + r];
     if (!IsMainView(rows)) {
-        if (TurnSameCamera(rows))
+        if (TurnSameCamera(rows) || ScaleHud(rows))
             for (int r = 0; r < 4; ++r)
                 for (int col = 0; col < 4; ++col) c[4 * col + r] = rows[4 * r + col];
         return false;
@@ -496,18 +518,21 @@ void Report() {
                     "main-view writes and %llu views of the main camera through another projection (%llu other views "
                     "left alone); copies turned: %llu in any frame, %llu scaled, %llu shadow masks, in "
                     "%llu scanned writes (%llu missed, every pending slot taken); %llu without a head pose, %llu "
-                    "off-centre, %llu frames with the identity camera; head-locked view: %llu drawn, %llu declined%s%s%s; "
+                    "off-centre, %llu frames with the identity camera; head-locked view: %llu drawn, %llu declined%s%s%s, "
+                    "%llu timewarped (largest %.2f degrees); %llu HUD views scaled; "
                     "head yaw %.1f pitch %.1f roll %.1f.",
                     U(g_frames), U(g_panelFrames), U(g_turnedView), U(g_turnedClip), U(g_turnedOthers),
                     U(g_otherViews), U(g_anyFrame), U(g_scaled), U(g_masks), U(g_scanned),
                     U(g_pendingFull), U(g_noPose), U(g_offCentre), U(g_ambiguous), U(g_lockDrawn), U(g_lockDeclined),
                     g_lockDeclined ? " (last: " : "", g_lockDeclined ? g_lockWhy : "", g_lockDeclined ? ")" : "",
+                    U(g_lockWarped), g_lockWarpMaxDeg, U(g_hudScaled),
                     g_lastYaw, g_lastPitch,
                     g_lastRoll);
     g_frames = g_panelFrames = g_turnedView = g_turnedClip = g_turnedOthers = g_otherViews = 0;
     g_anyFrame = g_scaled = g_masks = g_scanned = g_pendingFull = 0;
     g_noPose = g_offCentre = g_ambiguous = 0;
-    g_lockDrawn = g_lockDeclined = 0;
+    g_lockDrawn = g_lockDeclined = g_lockWarped = g_hudScaled = 0;
+    g_lockWarpMaxDeg = 0;
 }
 
 // --- the head-locked view (onfoot_look.h) ----------------------------------
@@ -618,11 +643,30 @@ bool LockCorners(float out[16]) {
         r[i] /= lr;
         u[i] /= lu;
     }
+    // The timewarp: the scene was rendered for the head as it was when the
+    // camera was turned (g_hRender); the eye is where the head is now. The
+    // rotation between the two, D = H_now^T H_render (OpenVR axes: x right,
+    // y up, z back), carries each corner from the rendered head's frame into
+    // the current one, so the window is where the picture was taken.
+    double dm[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    float now[12];
+    if (!Skipped(kPartTimewarp) && g_qValid && headPose(now)) {
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                dm[i][j] = now[i] * g_hRender[0][j] + now[4 + i] * g_hRender[1][j] + now[8 + i] * g_hRender[2][j];
+        const double cosAngle = std::fmax(-1.0, std::fmin(1.0, (dm[0][0] + dm[1][1] + dm[2][2] - 1) / 2));
+        const double deg = std::acos(cosAngle) * 57.29577951308232;
+        if (deg > 0.01) ++g_lockWarped;
+        g_lockWarpMaxDeg = std::fmax(g_lockWarpMaxDeg, deg);
+    }
     const double tx = 1 / g_mainScale[0], ty = 1 / g_mainScale[1];
     const int kCorner[4][2] = {{-1, 1}, {1, 1}, {-1, -1}, {1, -1}};
     for (int c = 0; c < 4; ++c) {
+        const double v[3] = {kCorner[c][0] * tx, kCorner[c][1] * ty, -1};
+        double h[3];
+        for (int i = 0; i < 3; ++i) h[i] = dm[i][0] * v[0] + dm[i][1] * v[1] + dm[i][2] * v[2];
         double d[3];
-        for (int i = 0; i < 3; ++i) d[i] = f[i] + kCorner[c][0] * tx * r[i] + kCorner[c][1] * ty * u[i];
+        for (int i = 0; i < 3; ++i) d[i] = h[0] * r[i] + h[1] * u[i] - h[2] * f[i];
         const double w = Dot3(row[3], d);
         if (w <= 0) return false;
         out[4 * c + 0] = static_cast<float>(Dot3(row[0], d));
@@ -758,13 +802,17 @@ void onFootLookConfigure(Config& cfg) {
                                  "in each eye at the game's own field of view)."
                                : "onfoot look: head-locked view off.");
     detail::g_onFootHeadLocked = locked;
+    const float hud = cfg.getFloat("experimental.onfoot_hud_scale", 1.0f);
+    const float hudClamped = hud < 0.3f ? 0.3f : (hud > 1.5f ? 1.5f : hud);
+    if (hudClamped != g_hudScale) Log::get().note("onfoot look: helmet HUD drawn at %.2f of its size.", hudClamped);
+    g_hudScale = hudClamped;
     const std::string skip = cfg.getString("experimental.onfoot_head_look_skip", "");
     unsigned mask = 0;
     const struct {
         const char* name;
         Part part;
     } kParts[] = {{"view", kPartView},     {"others", kPartOthers}, {"mask", kPartMask},
-                  {"frames", kPartFrames}, {"scaled", kPartScaled}};
+                  {"frames", kPartFrames}, {"scaled", kPartScaled}, {"timewarp", kPartTimewarp}};
     for (const auto& p : kParts)
         if (skip.find(p.name) != std::string::npos) mask |= p.part;
     if (mask != g_skip) Log::get().note("onfoot look: parts left out: \"%s\" (mask %u).", skip.c_str(), mask);
