@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdio>  // _snwprintf_s
+#include <cstring>  // memcpy
 
 namespace edvr {
 namespace {
@@ -217,6 +218,18 @@ struct Shared {
     //          on-foot stereo (experimental.onfoot_stereo) wants each eye's
     //          image submitted to the other eye. See frame_flag.h.
     volatile LONG     eyeSwap;
+    // onFootFlat      d3d11 -> openvr, written every frame: nonzero while the
+    //                 on-foot stereo renders each eye as the game's flat
+    //                 frustum from that eye's position. See frame_flag.h.
+    // onFootFlatTan   its half-width and half-height tangents, float bits.
+    // gameSubmitTex   openvr -> d3d11: the texture the game submitted for
+    //                 each eye (0 left, 1 right), before any EDVR swap.
+    // eyeSeparation   openvr -> d3d11: metres between the located eye
+    //                 views, float bits; 0 until the runtime has located.
+    volatile LONG     onFootFlat;
+    volatile LONG     onFootFlatTan[2];
+    volatile LONG64   gameSubmitTex[2];
+    volatile LONG     eyeSeparation;
 };
 
 // Per PROCESS, not per logon session.
@@ -233,6 +246,8 @@ struct Shared {
 // The name is built once, at first use. The two DLLs are in the same process,
 // so the channel between them is unaffected.
 //
+// _v37 because the on-foot stereo's flat frustum, the game's submitted
+// textures and the eye separation joined.
 // _v36 because the on-foot stereo's eyeSwap joined.
 // _v35 because the pose-reader hunt joined (poseReaderRequest and the
 // poseReader* call snapshot), for advanced.eye_origin_readers (docs/design-
@@ -304,7 +319,7 @@ const wchar_t* mappingName() {
     static wchar_t name[64];
     static bool built = false;
     if (!built) {
-        _snwprintf_s(name, _TRUNCATE, L"Local\\edvr_glitch_frame_v36_%lu",
+        _snwprintf_s(name, _TRUNCATE, L"Local\\edvr_glitch_frame_v37_%lu",
                      GetCurrentProcessId());
         built = true;
     }
@@ -557,6 +572,64 @@ void setEyeSwap(bool on) {
 bool eyeSwap() {
     Shared* s = map();
     return s && s->eyeSwap != 0;
+}
+
+namespace {
+LONG FloatBits(float v) {
+    LONG b;
+    static_assert(sizeof(b) == sizeof(v), "float bits");
+    memcpy(&b, &v, sizeof(b));
+    return b;
+}
+float BitsFloat(LONG b) {
+    float v;
+    memcpy(&v, &b, sizeof(v));
+    return v;
+}
+}  // namespace
+
+void setOnFootFlat(bool on, float tanX, float tanY) {
+    Shared* s = map();
+    if (!s) return;
+    if (on) {
+        InterlockedExchange(&s->onFootFlatTan[0], FloatBits(tanX));
+        InterlockedExchange(&s->onFootFlatTan[1], FloatBits(tanY));
+    }
+    InterlockedExchange(&s->onFootFlat, on ? 1 : 0);
+}
+
+bool onFootFlat(float* tanX, float* tanY) {
+    Shared* s = map();
+    if (!s || !s->onFootFlat) return false;
+    const float x = BitsFloat(s->onFootFlatTan[0]), y = BitsFloat(s->onFootFlatTan[1]);
+    if (!(x > 0.05f && x < 20.0f && y > 0.05f && y < 20.0f)) return false;
+    if (tanX) *tanX = x;
+    if (tanY) *tanY = y;
+    return true;
+}
+
+void publishGameSubmit(int eye, void* texture) {
+    Shared* s = map();
+    if (!s || eye < 0 || eye > 1) return;
+    InterlockedExchange64(&s->gameSubmitTex[eye], reinterpret_cast<LONG64>(texture));
+}
+
+void* gameSubmitted(int eye) {
+    Shared* s = map();
+    if (!s || eye < 0 || eye > 1) return nullptr;
+    return reinterpret_cast<void*>(s->gameSubmitTex[eye]);
+}
+
+void announceEyeSeparation(float metres) {
+    Shared* s = map();
+    if (s) InterlockedExchange(&s->eyeSeparation, FloatBits(metres));
+}
+
+float eyeSeparation() {
+    Shared* s = map();
+    if (!s) return 0.0f;
+    const float v = BitsFloat(s->eyeSeparation);
+    return v > 0.03f && v < 0.1f ? v : 0.0f;
 }
 
 void setExternalCameraOnFoot(bool on) {

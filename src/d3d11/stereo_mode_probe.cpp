@@ -762,6 +762,10 @@ void StereoFrame() {
 
 }  // namespace
 
+bool onFootStereoWanted() {
+    return g_stereoPatched && g_stereoData && *g_stereoData && journalOnFootKnown() && journalOnFoot();
+}
+
 void stereoModeProbeConfigure(Config& cfg) {
     const bool stereo = cfg.getBool("experimental.onfoot_stereo", false);
     if (stereo && !g_stereoTried) InstallStereoPatch();

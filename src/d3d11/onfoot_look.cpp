@@ -15,6 +15,7 @@
 #include "binding_shadow.h"
 #include "draw_census.h"
 #include "journal_watch.h"
+#include "stereo_mode_probe.h"
 #include "vscreen.h"
 
 namespace edvr {
@@ -60,6 +61,7 @@ uint32_t g_panelW = 0, g_panelH = 0;  // refreshed each frame
 uint32_t g_rtvGen = 0, g_dsvGen = 0;
 bool g_stereoDiag = false;  // experimental.onfoot_stereo_diag: eye-sized G-buffers count too
 bool g_rtvIsPanelGBuffer = false;
+bool g_rtvIsAnyGBuffer = false;  // the diagnostic's: any R10G10B10A2 target with depth, 1024 wide or more
 // The last R10G10B10A2 target with a depth bound, whatever its size: what the
 // "on foot but no panel scene" line reports, so a size mismatch is visible.
 uint32_t g_lastGbufW = 0, g_lastGbufH = 0;
@@ -92,7 +94,15 @@ constexpr double kMatch = 1e-3;
 
 // Developer switches (experimental.onfoot_head_look_skip): parts of the turn
 // left out, to see by eye which one a visual fault follows. Live.
-enum Part : unsigned { kPartView = 1, kPartOthers = 2, kPartMask = 4, kPartFrames = 8, kPartScaled = 16, kPartTimewarp = 32 };
+enum Part : unsigned {
+    kPartView = 1,
+    kPartOthers = 2,
+    kPartMask = 4,
+    kPartFrames = 8,
+    kPartScaled = 16,
+    kPartTimewarp = 32,
+    kPartHudEye = 64,  // the on-foot stereo's move of the helmet HUD's eye
+};
 unsigned g_skip = 0;
 bool Skipped(Part p) { return (g_skip & p) != 0; }
 
@@ -107,6 +117,73 @@ const char* g_lockWhy = "";
 double g_lastYaw = 0, g_lastPitch = 0, g_lastRoll = 0;
 ULONGLONG g_lastReport = 0;
 bool g_loggedFirst = false, g_loggedLock = false;
+
+// --- the on-foot stereo's eyes (experimental.onfoot_stereo) ------------------
+//
+// With the engine kept in HMD stereo on foot (stereo_mode_probe.h), both eye
+// pipelines render the whole flat scene, each into its own targets, the two
+// interleaved stage by stage: the census of 2026-09-24 saw the depth, the
+// G-buffer and the lighting passes alternate between two panel-sized depth
+// targets, and each pipeline's final is the texture the game submits for one
+// eye. Both read the same camera -- the body camera, camera-relative (the
+// eye at the origin), no head, no eye offset -- through the shared b0 and b1,
+// rewritten for every pass. The head look turns it for both; this moves each
+// pipeline's eye half the IPD along the turned camera's right axis, and tells
+// the runtime to place each image at the flat frustum's own angles inside
+// the eye's field (frame_flag.h, onFootFlat), where the headset's compositor
+// reprojects it like any eye image.
+//
+// Moving the eye is one number per clip transform. Camera-relative, clip =
+// P V (x - e) for an eye at e, and e along the camera's right axis moves only
+// the x row's translation, by -sx * offset, sx the projection's x scale (the
+// x row's length over the w row's, whatever model scale the transform
+// carries). The writes moved are the main camera's: the main view, the same
+// camera through a model, and the helmet HUD (part "hudeye"), in b0's rows at
+// 64 and b1's slot at 4320. The lighting passes' own copies (inverses) are
+// left: lit as if from the centre, three centimetres off.
+//
+// WHICH EYE. A pass's first camera write comes while the other pipeline's
+// targets are still bound (the write before a pipeline's first draw follows
+// the other's last one). So each write is moved for the pipeline that last
+// drew, the unmoved write is kept, and at a draw into the other pipeline's
+// depth target the buffer is written again for it -- a Map-discard through
+// the real Map (onFootLookSetMapFns), which this module's tee never sees. The
+// pipelines are told apart by their panel-sized depth targets: a new one
+// belongs to the pipeline other than the last one that drew (their depth,
+// then the HUD's pair after both lightings). Which pipeline is the LEFT eye:
+// the texture the game submits for the left eye (frame_flag.h,
+// gameSubmitted) is one of that pipeline's render targets.
+OnFootMapFn g_realMap = nullptr;
+OnFootUnmapFn g_realUnmap = nullptr;
+float g_ipdMm = 0;  // experimental.onfoot_stereo_ipd_mm: 0 the headset's, below 0 no move
+bool g_stereoOn = false, g_stereoWasOn = false;  // this frame: on-foot stereo, the image flat
+double g_halfIpd = 0;                            // metres, this frame
+int g_leftPipe = 0;                              // the pipeline (0 = the first seen) that is the left eye
+bool g_leftKnown = false, g_leftGuessNoted = false;
+int g_curPipe = -1, g_lastPipe = -1;  // the draw's pipeline, the last known one
+uint32_t g_pipeDsvGen = 0, g_pipeRtvGen = 0;
+struct PipeTarget {
+    void* res;
+    int pipe;
+};
+constexpr int kMaxPipeTargets = 8;
+PipeTarget g_pipeTargets[kMaxPipeTargets] = {};
+int g_pipeTargetCount = 0;
+void* g_pipeRtvs[2][8] = {};
+int g_pipeRtvCount[2] = {};
+uint64_t g_stereoFrames = 0;
+// The last camera writes as turned and unmoved, how much to move them per
+// metre, and for which pipeline they were written. b0 is 208 bytes.
+constexpr UINT kB0Moved = kViewOffset / 4 + 3;   // row 0, column 3
+constexpr UINT kB1Moved = kClipOffset / 4 + 12;  // by columns: column 3, row 0
+float g_b0Copy[64] = {};
+float g_b1Copy[kMaxScanBytes / 4] = {};
+UINT g_b0CopyBytes = 0, g_b1CopyBytes = 0;
+double g_b0Sx = 0, g_b1Sx = 0;
+int g_b0Pipe = -1, g_b1Pipe = -1;
+bool g_viewDiscard = false, g_frameDiscard = false;  // the game's Map of b0 / b1 was a discard
+uint64_t g_moved = 0, g_rewrites = 0, g_rewriteFails = 0, g_notDiscard = 0, g_newTargets = 0;
+
 
 bool Near(double v, double target, double tol) { return std::fabs(v - target) < tol; }
 
@@ -440,6 +517,7 @@ bool PanelGBufferBound() {
     g_rtvGen = rg;
     g_dsvGen = dg;
     g_rtvIsPanelGBuffer = false;
+    g_rtvIsAnyGBuffer = false;
     auto* rtv = static_cast<ID3D11RenderTargetView*>(bindingGet(BindSlot::Rtv0));
     if (!rtv || !bindingGet(BindSlot::Dsv0) || !g_panelW) return false;
     D3D11_RENDER_TARGET_VIEW_DESC rd;
@@ -454,7 +532,8 @@ bool PanelGBufferBound() {
         tex->GetDesc(&td);
         g_lastGbufW = td.Width;
         g_lastGbufH = td.Height;
-        g_rtvIsPanelGBuffer = (td.Width == g_panelW && td.Height == g_panelH) || (g_stereoDiag && td.Width >= 1024);
+        g_rtvIsPanelGBuffer = td.Width == g_panelW && td.Height == g_panelH;
+        g_rtvIsAnyGBuffer = td.Width >= 1024;
         tex->Release();
     }
     res->Release();
@@ -521,18 +600,23 @@ void Report() {
                     "%llu scanned writes (%llu missed, every pending slot taken); %llu without a head pose, %llu "
                     "off-centre, %llu frames with the identity camera; head-locked view: %llu drawn, %llu declined%s%s%s, "
                     "%llu timewarped (largest %.2f degrees); %llu HUD views scaled; "
+                    "stereo: %s, %llu camera writes moved, %llu written again for the other eye (%llu failed, %llu "
+                    "not discards), %llu new eye targets, left eye = %s pipeline%s, half IPD %.2f mm; "
                     "head yaw %.1f pitch %.1f roll %.1f.",
                     U(g_frames), U(g_panelFrames), U(g_turnedView), U(g_turnedClip), U(g_turnedOthers),
                     U(g_otherViews), U(g_anyFrame), U(g_scaled), U(g_masks), U(g_scanned),
                     U(g_pendingFull), U(g_noPose), U(g_offCentre), U(g_ambiguous), U(g_lockDrawn), U(g_lockDeclined),
                     g_lockDeclined ? " (last: " : "", g_lockDeclined ? g_lockWhy : "", g_lockDeclined ? ")" : "",
-                    U(g_lockWarped), g_lockWarpMaxDeg, U(g_hudScaled),
+                    U(g_lockWarped), g_lockWarpMaxDeg, U(g_hudScaled), g_stereoOn ? "on" : "off", U(g_moved),
+                    U(g_rewrites), U(g_rewriteFails), U(g_notDiscard), U(g_newTargets),
+                    g_leftPipe == 0 ? "first" : "second", g_leftKnown ? "" : " (assumed)", g_halfIpd * 1000,
                     g_lastYaw, g_lastPitch,
                     g_lastRoll);
     g_frames = g_panelFrames = g_turnedView = g_turnedClip = g_turnedOthers = g_otherViews = 0;
     g_anyFrame = g_scaled = g_masks = g_scanned = g_pendingFull = 0;
     g_noPose = g_offCentre = g_ambiguous = 0;
     g_lockDrawn = g_lockDeclined = g_lockWarped = g_hudScaled = 0;
+    g_moved = g_rewrites = g_rewriteFails = g_notDiscard = g_newTargets = 0;
     g_lockWarpMaxDeg = 0;
 }
 
@@ -771,7 +855,8 @@ bool EyeFromClip(const float* e, double c[3], double f[3], double r[3], double u
 }
 
 void DiagDraw() {
-    const bool bound = PanelGBufferBound();
+    PanelGBufferBound();
+    const bool bound = g_rtvIsAnyGBuffer;
     if (bound && !g_diagWasBound && g_diagCount < kDiagPasses && g_lastB1Valid) {
         DiagPass& d = g_diagPass[g_diagCount++];
         d.rtv = bindingGet(BindSlot::Rtv0);
@@ -820,6 +905,211 @@ void DiagFrame() {
     }
     g_diagCount = 0;
     g_diagWasBound = false;
+}
+
+// --- the on-foot stereo's eyes: the work ------------------------------------
+
+// The eye offset of a pipeline along the camera's right axis, metres.
+double PipeOffset(int pipe) { return pipe == g_leftPipe ? -g_halfIpd : g_halfIpd; }
+
+// rows (by rows, turned): sx to move by, or 0 when not the main camera -- a
+// centred perspective with the main aspect and the main near plane (the main
+// view, the same camera through a model), or the helmet HUD's nearer one.
+double MoveScale(const float* rows) {
+    if (!g_haveMain) return 0;
+    const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
+    if (sx < 1e-6 || sy < 1e-6 || sw < 1e-6) return 0;
+    const double aspect = g_mainScale[0] / g_mainScale[1];
+    if (!Near(sx / sy, aspect, 5e-3 * aspect)) return 0;
+    if (std::fabs(rows[8]) > 1e-4 || std::fabs(rows[9]) > 1e-4 || std::fabs(rows[10]) > 1e-4 || rows[11] <= 0)
+        return 0;
+    const bool mainNear = Near(rows[11], g_mainNear, 0.02 * g_mainNear);
+    const bool hud = !mainNear && !Skipped(kPartHudEye) && Near(sw, 1, 1e-3) && sx > 1.1 * g_mainScale[0];
+    if (!mainNear && !hud) return 0;
+    const double dot = double(rows[0]) * rows[12] + double(rows[1]) * rows[13] + double(rows[2]) * rows[14];
+    if (std::fabs(dot) > 1e-3 * sx * sw) return 0;
+    return sx / sw;
+}
+
+int PredictPipe() { return g_curPipe >= 0 ? g_curPipe : (g_lastPipe >= 0 ? g_lastPipe : 0); }
+
+// b0 as the game wrote it and the head look turned it (mapped, write-combined;
+// rows the turned rows already read out): kept, and moved for a pipeline.
+void StereoViewWritten(float* mapped, const float* rows) {
+    g_b0Sx = 0;
+    if (!g_stereoOn || g_viewBytes > sizeof(g_b0Copy)) return;
+    const double sx = MoveScale(rows);
+    if (sx <= 0) return;
+    if (!g_viewDiscard) {
+        ++g_notDiscard;
+        return;
+    }
+    memcpy(g_b0Copy, mapped, g_viewBytes);
+    g_b0CopyBytes = g_viewBytes;
+    g_b0Sx = sx;
+    g_b0Pipe = PredictPipe();
+    mapped[kB0Moved] = static_cast<float>(g_b0Copy[kB0Moved] - sx * PipeOffset(g_b0Pipe));
+    ++g_moved;
+}
+
+// b1 in ordinary memory, turned, before it is written back.
+void StereoFrameWritten(float* work) {
+    g_b1Sx = 0;
+    if (!g_stereoOn) return;
+    const float* c = work + kClipOffset / 4;
+    float rows[16];
+    for (int r = 0; r < 4; ++r)
+        for (int col = 0; col < 4; ++col) rows[4 * r + col] = c[4 * col + r];
+    const double sx = MoveScale(rows);
+    if (sx <= 0) return;
+    if (!g_frameDiscard) {
+        ++g_notDiscard;
+        return;
+    }
+    memcpy(g_b1Copy, work, g_frameFloats * 4);
+    g_b1CopyBytes = g_frameFloats * 4;
+    g_b1Sx = sx;
+    g_b1Pipe = PredictPipe();
+    work[kB1Moved] = static_cast<float>(g_b1Copy[kB1Moved] - sx * PipeOffset(g_b1Pipe));
+    ++g_moved;
+}
+
+// The pipeline whose depth target this draw uses; -1 for none of theirs.
+int PipeOfDraw() {
+    const uint32_t dg = bindingGeneration(BindSlot::Dsv0);
+    if (dg == g_pipeDsvGen) return g_curPipe;
+    g_pipeDsvGen = dg;
+    g_curPipe = -1;
+    auto* dsv = static_cast<ID3D11DepthStencilView*>(bindingGet(BindSlot::Dsv0));
+    if (!dsv) return -1;
+    ID3D11Resource* res = nullptr;
+    dsv->GetResource(&res);
+    if (!res) return -1;
+    for (int i = 0; i < g_pipeTargetCount; ++i)
+        if (g_pipeTargets[i].res == res) g_curPipe = g_pipeTargets[i].pipe;
+    if (g_curPipe < 0) {
+        ID3D11Texture2D* tex = nullptr;
+        if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&tex))) && tex) {
+            D3D11_TEXTURE2D_DESC td;
+            tex->GetDesc(&td);
+            tex->Release();
+            if (td.Width == g_panelW && td.Height == g_panelH) {
+                if (g_pipeTargetCount == kMaxPipeTargets) g_pipeTargetCount = 0;
+                g_curPipe = g_lastPipe >= 0 ? 1 - g_lastPipe : 0;
+                g_pipeTargets[g_pipeTargetCount++] = {res, g_curPipe};
+                ++g_newTargets;
+            }
+        }
+    }
+    res->Release();
+    if (g_curPipe >= 0) g_lastPipe = g_curPipe;
+    return g_curPipe;
+}
+
+// The render target of a draw of a pipeline, remembered for the left-eye match.
+void NotePipeTarget(int pipe) {
+    const uint32_t rg = bindingGeneration(BindSlot::Rtv0);
+    if (rg == g_pipeRtvGen) return;
+    g_pipeRtvGen = rg;
+    auto* rtv = static_cast<ID3D11RenderTargetView*>(bindingGet(BindSlot::Rtv0));
+    if (!rtv) return;
+    ID3D11Resource* res = nullptr;
+    rtv->GetResource(&res);
+    if (!res) return;
+    res->Release();  // compared by address only
+    for (int i = 0; i < g_pipeRtvCount[pipe]; ++i)
+        if (g_pipeRtvs[pipe][i] == res) return;
+    if (g_pipeRtvCount[pipe] < 8) g_pipeRtvs[pipe][g_pipeRtvCount[pipe]++] = res;
+}
+
+void Rewrite(ID3D11DeviceContext* ctx, ID3D11Buffer* buf, const float* copy, UINT bytes, UINT moved, double sx,
+             int pipe) {
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (!g_realMap || !g_realUnmap || !buf || FAILED(g_realMap(ctx, buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)) ||
+        !m.pData) {
+        ++g_rewriteFails;
+        return;
+    }
+    memcpy(m.pData, copy, bytes);
+    static_cast<float*>(m.pData)[moved] = static_cast<float>(copy[moved] - sx * PipeOffset(pipe));
+    g_realUnmap(ctx, buf, 0);
+    ++g_rewrites;
+}
+
+void StereoDraw(ID3D11DeviceContext* ctx) {
+    const int pipe = PipeOfDraw();
+    if (pipe < 0) return;
+    NotePipeTarget(pipe);
+    if (g_b0Sx > 0 && g_b0Pipe != pipe) {
+        Rewrite(ctx, g_viewCb, g_b0Copy, g_b0CopyBytes, kB0Moved, g_b0Sx, pipe);
+        g_b0Pipe = pipe;
+    }
+    if (g_b1Sx > 0 && g_b1Pipe != pipe) {
+        Rewrite(ctx, g_frameCb, g_b1Copy, g_b1CopyBytes, kB1Moved, g_b1Sx, pipe);
+        g_b1Pipe = pipe;
+    }
+}
+
+void StereoForget() {
+    g_pipeTargetCount = 0;
+    g_curPipe = g_lastPipe = -1;
+    g_pipeDsvGen = g_pipeRtvGen = 0;
+    g_leftKnown = g_leftGuessNoted = false;
+    g_leftPipe = 0;
+    g_b0Sx = g_b1Sx = 0;
+}
+
+// The frame that ended: which pipeline the game submitted as the left eye.
+// Then the coming frame: on or off, the half IPD, the flat frustum published.
+void StereoFrameBoundary() {
+    if (g_stereoOn) {
+        ++g_stereoFrames;
+        void* left = gameSubmitted(0);
+        void* right = gameSubmitted(1);
+        int leftPipe = -1;
+        for (int p = 0; p < 2; ++p)
+            for (int i = 0; i < g_pipeRtvCount[p]; ++i) {
+                if (left && g_pipeRtvs[p][i] == left) leftPipe = p;
+                if (right && g_pipeRtvs[p][i] == right) leftPipe = 1 - p;
+            }
+        if (leftPipe >= 0 && (!g_leftKnown || leftPipe != g_leftPipe)) {
+            Log::get().note("onfoot stereo: the %s pipeline renders the left eye (its target is the texture the game "
+                            "submits for it).",
+                            leftPipe == 0 ? "first" : "second");
+            g_leftPipe = leftPipe;
+            g_leftKnown = true;
+        }
+        if (!g_leftKnown && !g_leftGuessNoted && g_stereoFrames > 300) {
+            g_leftGuessNoted = true;
+            Log::get().note("onfoot stereo: no pipeline's target is a submitted texture (left %p, right %p); the first "
+                            "pipeline is taken as the left eye (onfoot_stereo_swap_eyes crosses them).",
+                            left, right);
+        }
+    }
+    g_pipeRtvCount[0] = g_pipeRtvCount[1] = 0;
+    g_pipeRtvGen = 0;
+    g_b0Sx = g_b1Sx = 0;  // last frame's writes
+
+    const bool want = onFootStereoWanted() && g_panelLastFrame && g_haveMain;
+    const double ipd = g_ipdMm > 0 ? g_ipdMm / 1000.0 : (g_ipdMm == 0 ? double(eyeSeparation()) : 0.0);
+    const bool on = want;
+    if (on != g_stereoWasOn) {
+        if (on)
+            Log::get().note("onfoot stereo: eyes %s (IPD %.1f mm at the start, %s); each image placed at the flat frustum's "
+                            "angles (x %.3f, y %.3f).",
+                            g_ipdMm >= 0 ? "moved" : "NOT moved", ipd * 1000,
+                            g_ipdMm > 0 ? "onfoot_stereo_ipd_mm" : (g_ipdMm == 0 ? "the headset's" : "off"),
+                            1 / g_mainScale[0], 1 / g_mainScale[1]);
+        else
+            Log::get().note("onfoot stereo: off (%llu frames).", static_cast<unsigned long long>(g_stereoFrames));
+        StereoForget();
+        g_stereoFrames = 0;
+        g_stereoWasOn = on;
+    }
+    g_stereoOn = on;
+    g_halfIpd = ipd / 2;
+    setOnFootFlat(on, on ? static_cast<float>(1 / g_mainScale[0]) : 0.0f,
+                  on ? static_cast<float>(1 / g_mainScale[1]) : 0.0f);
 }
 
 // --- capture: the census key (hotkey.dump_draws) on foot ---------------------
@@ -929,22 +1219,36 @@ void onFootLookConfigure(Config& cfg) {
     const struct {
         const char* name;
         Part part;
-    } kParts[] = {{"view", kPartView},     {"others", kPartOthers}, {"mask", kPartMask},
-                  {"frames", kPartFrames}, {"scaled", kPartScaled}, {"timewarp", kPartTimewarp}};
+    } kParts[] = {{"view", kPartView},     {"others", kPartOthers},     {"mask", kPartMask},
+                  {"frames", kPartFrames}, {"scaled", kPartScaled},     {"timewarp", kPartTimewarp},
+                  {"hudeye", kPartHudEye}};
     for (const auto& p : kParts)
         if (skip.find(p.name) != std::string::npos) mask |= p.part;
     if (mask != g_skip) Log::get().note("onfoot look: parts left out: \"%s\" (mask %u).", skip.c_str(), mask);
     g_skip = mask;
+    const float ipd = cfg.getFloat("experimental.onfoot_stereo_ipd_mm", 0.0f);
+    if (ipd != g_ipdMm)
+        Log::get().note("onfoot stereo: IPD %s.", ipd > 0 ? "from onfoot_stereo_ipd_mm" : (ipd == 0 ? "the headset's" : "none: the eyes are not moved"));
+    g_ipdMm = ipd;
     if (!on) {
+        if (g_stereoWasOn) setOnFootFlat(false, 0, 0);
+        g_stereoOn = g_stereoWasOn = false;
+        StereoForget();
         g_viewData = g_frameData = nullptr;
         g_panelLastFrame = false;
     }
 }
 
-void onFootLookBeforeDraw() {
+void onFootLookSetMapFns(OnFootMapFn map, OnFootUnmapFn unmap) {
+    g_realMap = map;
+    g_realUnmap = unmap;
+}
+
+void onFootLookBeforeDraw(ID3D11DeviceContext* ctx) {
     if (!detail::g_onFootLookEnabled) return;
     ++g_drawOrdinal;
     if (g_stereoDiag) DiagDraw();
+    if (g_stereoOn && ctx) StereoDraw(ctx);
     if (g_foundThisFrame) return;
     if (!PanelGBufferBound()) return;
     g_foundThisFrame = true;
@@ -955,10 +1259,12 @@ void onFootLookMapped(ID3D11Resource* res, void* data, D3D11_MAP type) {
     if (!detail::g_onFootLookEnabled || type == D3D11_MAP_READ || !res || res == g_lockCb) return;
     if (res == g_viewCb) {
         g_viewData = data;
+        g_viewDiscard = type == D3D11_MAP_WRITE_DISCARD;
         return;
     }
     if (res == g_frameCb) {
         g_frameData = data;
+        g_frameDiscard = type == D3D11_MAP_WRITE_DISCARD;
         return;
     }
     // Any other small constant or shader-resource buffer rewritten whole
@@ -994,6 +1300,7 @@ void onFootLookBeforeUnmap(ID3D11Resource* res) {
         TurnView(a);
         memcpy(g_viewShadow, a, sizeof(g_viewShadow));
         g_viewShadowFresh = true;
+        StereoViewWritten(static_cast<float*>(g_viewData), g_viewShadow);
         g_viewData = nullptr;
     } else if (res == g_frameCb && g_frameData) {
         // The view slot (4320) is turned only for the main view; every b1
@@ -1006,6 +1313,7 @@ void onFootLookBeforeUnmap(ID3D11Resource* res) {
         if (Armed())
             TurnCopies(work, g_frameFloats, {kClipOffset / 4, kClipOffset / 4 + 16},
                        {kPrevPoseOffset / 4, kPrevPoseOffset / 4 + 12});
+        StereoFrameWritten(work);
         memcpy(g_frameData, work, g_frameFloats * 4);
         memcpy(g_eyeClip, work + kClipOffset / 4, sizeof(g_eyeClip));
         g_eyeClipValid = true;
@@ -1024,6 +1332,7 @@ void onFootLookBeforeUnmap(ID3D11Resource* res) {
 
 void onFootLookStateCleared() {
     g_rtvGen = g_dsvGen = 0;
+    g_pipeDsvGen = g_pipeRtvGen = 0;
     g_rtvIsPanelGBuffer = false;
 }
 
@@ -1044,6 +1353,7 @@ void onFootLookFrameBoundary() {
     g_qTaken = false;
     g_frameRValid = false;
     for (Pending& p : g_pending) p = {};
+    StereoFrameBoundary();
     uint32_t w = 0, h = 0;
     if (vScreenPanelSize(&w, &h) && (w != g_panelW || h != g_panelH)) {
         g_panelW = w;

@@ -55,8 +55,17 @@ inline bool onFootLookEnabled() { return detail::g_onFootLookEnabled; }
 
 // At every game draw on the owner context (after vscreen's verdict, which
 // leaves the draw to the game). Learns the buffers and the main projection at
-// the first panel-sized G-buffer draw of a frame; returns at once after it.
-void onFootLookBeforeDraw();
+// the first panel-sized G-buffer draw of a frame; with the on-foot stereo,
+// writes the camera again for the eye whose targets this draw uses.
+void onFootLookBeforeDraw(ID3D11DeviceContext* ctx);
+
+// The context's real Map and Unmap (vscreen's, behind its own hooks): the
+// on-foot stereo's second write of a camera buffer goes through them, so the
+// Unmap tee never sees its own write.
+typedef HRESULT(__stdcall* OnFootMapFn)(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT,
+                                        D3D11_MAPPED_SUBRESOURCE*);
+typedef void(__stdcall* OnFootUnmapFn)(ID3D11DeviceContext*, ID3D11Resource*, UINT);
+void onFootLookSetMapFns(OnFootMapFn map, OnFootUnmapFn unmap);
 
 // Map of any resource on the owner context: remembers the pointer of the
 // learned per-view buffers and of other small buffers rewritten whole.
