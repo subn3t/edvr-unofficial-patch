@@ -2,12 +2,28 @@
 
 ## Status
 
-State (2026-09-23): flight 1 flown (166b9eb): head look works; shadows
-follow the head; big head turns show culled geometry. Flight 2 built: every
-exact copy of the camera rotation in the frame's constant buffers is
-rotated too (lighting, shadow lookup, sky), plus b1's previous pose (3728)
-and reprojection (4512). `experimental.onfoot_head_look`
-(`src/d3d11/onfoot_look.cpp`); the panel itself is unchanged.
+State (2026-09-23, late): milestones 1 and 2 work in the field, mono.
+
+- Head look (`experimental.onfoot_head_look`): the head turns the game's
+  camera and every copy of it the frame carries (docs/cobra-onfoot-frame.md);
+  shadows, atmosphere, sky and the Milky Way hold still, the helmet HUD
+  stays with the head. Parts kept, each shown needed by a field A/B: view,
+  others (atmosphere), mask (shadows), frames (sky), scaled (a fuzzy black
+  bar otherwise).
+- Head-locked view (`experimental.onfoot_head_locked`): no screen; the
+  scene drawn in each eye at the game's own field of view, at infinity,
+  timewarped by the head's turn since the render (without it, a slight
+  swim: ~90% of frames moved, up to 0.7 degrees). Field: upright, single,
+  comfortable, scale about right. `experimental.onfoot_hud_scale` pulls the
+  helmet HUD in from the window's corners.
+- Open: menus (esc) are drawn across the whole window, at the edge of the
+  headset's field; the window's size follows the game's on-foot FOV setting.
+- Next: stereo. Recon first for the engine's own panel-versus-stereo
+  decision on foot (game memory); otherwise alternate-eye rendering on this
+  stack (camera translation by half the IPD and its copies, each eye's last
+  image kept and timewarped, temporal effects).
+
+History:
 
 Flight 1 results:
 - H1 refuted as built: only b0+64 and cb1[270..273] were rotated, and the
