@@ -393,7 +393,7 @@ int wmain(int argc, wchar_t** argv) {
     // frame_flag's layout check (the roll-call, since v34). Last, because a refusal it provokes
     // is meant to outlast it. This process holds one half, so the roll-call
     // has one signature and there is nothing to name...
-    check(edvr::kFrameFlagVersion == 35, "frame_flag layout is v35");
+    check(edvr::kFrameFlagVersion == 36, "frame_flag layout is v36");
     check(edvr::frameFlagPeerMismatch() == 0, "one half alone is no mismatch");
     {
         wchar_t name[64];

@@ -11,6 +11,7 @@
 
 #include "../common/code_hook.h"
 #include "../common/config.h"
+#include "../common/frame_flag.h"
 #include "../common/log.h"
 #include "journal_watch.h"
 
@@ -672,6 +673,7 @@ uint8_t* g_stereoStub = nullptr;
 volatile uint8_t* g_stereoData = nullptr;  // +0 flag, +4 substitutions
 bool g_stereoTried = false, g_stereoPatched = false;
 uint32_t g_stereoLastCount = 0;
+bool g_swapWanted = false;
 
 void InstallStereoPatch() {
     g_stereoTried = true;
@@ -748,6 +750,9 @@ void InstallStereoPatch() {
 }
 
 void StereoFrame() {
+    // The eyes, crossed on foot in the first stereo flight: each image to the
+    // other eye while on foot with the stereo on.
+    setEyeSwap(g_stereoPatched && g_swapWanted && *g_stereoData && journalOnFootKnown() && journalOnFoot());
     if (!g_stereoPatched) return;
     const uint32_t count = *reinterpret_cast<volatile const uint32_t*>(g_stereoData + 4);
     if (count && !g_stereoLastCount)
@@ -767,6 +772,10 @@ void stereoModeProbeConfigure(Config& cfg) {
         *g_stereoData = want;
     }
     g_watchWanted = cfg.getBool("experimental.stereo_mode_watch", false);
+    const bool swap = cfg.getBool("experimental.onfoot_stereo_swap_eyes", false);
+    if (swap != g_swapWanted)
+        Log::get().note("onfoot stereo: eyes %s on foot (live).", swap ? "SWAPPED" : "as the game submits them");
+    g_swapWanted = swap;
     const bool on = cfg.getBool("experimental.stereo_mode_probe", false);
     const int override = cfg.getInt("experimental.stereo_mode_override", -1);
     if (on && !g_installTried) install();

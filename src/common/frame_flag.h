@@ -24,7 +24,7 @@ namespace edvr {
 //
 // Both DLLs compile frame_flag.cpp, and the shared block's layout changes
 // with it, so the block's name carries the version
-// (Local\edvr_glitch_frame_v35_<pid>): halves from different builds never
+// (Local\edvr_glitch_frame_v36_<pid>): halves from different builds never
 // share one. That kept a mismatched pair inert, but silently. Since v34
 // each half also signs a small version-independent roll-call with the
 // version it was built with, and looks for the last unsigned layout's
@@ -32,7 +32,7 @@ namespace edvr {
 // version REFUSES the channel -- from then on every call here reads as "no
 // answer" and writes nothing -- and frameFlagPeerMismatch() names the
 // partner's version so the caller's log can say both.
-constexpr uint32_t kFrameFlagVersion = 35;
+constexpr uint32_t kFrameFlagVersion = 36;
 
 // The partner half's layout version when it differs from kFrameFlagVersion,
 // else 0. Nonzero means the channel is refused. Each half asks on a cadence
@@ -179,6 +179,12 @@ uint32_t jumpVerdictPacked();
 // reads, so "d3d11 says no" and "d3d11 has stopped saying anything" stay
 // distinguishable.
 void setExternalCameraOnFoot(bool on);
+
+// On-foot stereo (experimental.onfoot_stereo_swap_eyes): d3d11 says, every
+// frame, whether the engine's on-foot stereo renders each eye's image with
+// the other eye's camera, so the runtime submits each to the other eye.
+void setEyeSwap(bool on);
+bool eyeSwap();
 
 // The last value written, whenever it was written.
 //
