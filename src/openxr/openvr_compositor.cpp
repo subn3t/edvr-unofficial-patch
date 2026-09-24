@@ -232,6 +232,8 @@ vr::EVRCompositorError OpenVRCompositor::Submit(vr::EVREye eye, const vr::Textur
   if (!source_) return trace.finish(kInvalid);
   const CompositorRead read = source_->compositorRead();
   if (!read.connected || read.generation == 0) return trace.finish(kInvalid);
+  // On-foot stereo whose eyes came out crossed (frame_flag.h, eyeSwap).
+  if (edvr::eyeSwap()) eye = eye == vr::Eye_Left ? vr::Eye_Right : vr::Eye_Left;
   return trace.finish(source_->submitEye(read.generation, eye, texture, bounds, flags));
 }
 

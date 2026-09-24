@@ -213,6 +213,10 @@ struct Shared {
     // bit0 render ptr on the calling thread's stack, bit1 game ptr on it,
     // bit2 this publish came from GetLastPoses rather than WaitGetPoses.
     volatile LONG     poseReaderFlags;
+    // eyeSwap  d3d11 -> openvr, written every frame: nonzero while the
+    //          on-foot stereo (experimental.onfoot_stereo) wants each eye's
+    //          image submitted to the other eye. See frame_flag.h.
+    volatile LONG     eyeSwap;
 };
 
 // Per PROCESS, not per logon session.
@@ -229,6 +233,7 @@ struct Shared {
 // The name is built once, at first use. The two DLLs are in the same process,
 // so the channel between them is unaffected.
 //
+// _v36 because the on-foot stereo's eyeSwap joined.
 // _v35 because the pose-reader hunt joined (poseReaderRequest and the
 // poseReader* call snapshot), for advanced.eye_origin_readers (docs/design-
 // transition-flash-engine-fix-2026-09-23.md). Two branches each took _v34
@@ -299,7 +304,7 @@ const wchar_t* mappingName() {
     static wchar_t name[64];
     static bool built = false;
     if (!built) {
-        _snwprintf_s(name, _TRUNCATE, L"Local\\edvr_glitch_frame_v35_%lu",
+        _snwprintf_s(name, _TRUNCATE, L"Local\\edvr_glitch_frame_v36_%lu",
                      GetCurrentProcessId());
         built = true;
     }
@@ -542,6 +547,16 @@ void noteJumpVerdict(uint32_t verdict) {
 uint32_t jumpVerdictPacked() {
     Shared* s = map();
     return s ? static_cast<uint32_t>(InterlockedCompareExchange(&s->jumpVerdict, 0, 0)) : 0u;
+}
+
+void setEyeSwap(bool on) {
+    Shared* s = map();
+    if (s) InterlockedExchange(&s->eyeSwap, on ? 1 : 0);
+}
+
+bool eyeSwap() {
+    Shared* s = map();
+    return s && s->eyeSwap != 0;
 }
 
 void setExternalCameraOnFoot(bool on) {
