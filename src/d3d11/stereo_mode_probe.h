@@ -31,4 +31,9 @@ class Config;
 
 void stereoModeProbeConfigure(Config& cfg);
 
+// Once a frame (vScreen's frame boundary): the ship/foot differ, which
+// snapshots the stereo mode's objects after each change of the journal's
+// on-foot state and logs what differs.
+void stereoModeProbeFrame();
+
 }  // namespace edvr
