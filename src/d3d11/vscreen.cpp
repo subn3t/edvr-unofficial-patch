@@ -710,6 +710,7 @@ struct State {
     // at the top of every beginPanelOverride, so it can never outlive the draw
     // that set it.
     bool     curveThisDraw = false;
+    bool     headLockThisDraw = false;  // onfoot_look.h: the composite drawn head-locked
 
     void*    compositeCb = nullptr;
     uint8_t  shadow[512] = {};
@@ -1901,6 +1902,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // Cleared before anything can set it, on every draw, so a substitution
     // can never be attributed to a draw that did not ask for one.
     s->curveThisDraw = false;
+    s->headLockThisDraw = false;
     t_uiDepthThisDraw = false;
     // Counting eye draws is not part of the panel distance fix, even though it
     // happens here.
@@ -2702,6 +2704,11 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // with the distance fix, which returns kPanel for this very draw.
     if (panelCurveWants() && srv0IsPanelSized(s, kind, count)) {
         s->curveThisDraw = true;
+    }
+    // The on-foot head-locked view (onfoot_look.h), the same recognition and
+    // above the same return for the same reason.
+    if (onFootLookHeadLockedWanted() && srv0IsPanelSized(s, kind, count)) {
+        s->headLockThisDraw = true;
     }
 
     if (!s->distanceEnabled) return DrawVerdict::kNone;
@@ -3775,6 +3782,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         // Clearing here rather than trusting the next draw to do it keeps the
         // flag's lifetime inside the one call that set it.
         g_state->curveThisDraw = false;
+        g_state->headLockThisDraw = false;
         return;
     }
     // fix.ui_quality, the UI layer (ui_layer.h): decided once for this draw
@@ -3827,6 +3835,19 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // The geometry substitution, which SWALLOWS the game's draw when it
     // succeeds and forwards it untouched when it does not -- so a failure
     // here is a flat screen, never a missing one.
+    // The head-locked view replaces the composite outright (it is not a
+    // screen, so neither the curve nor the distance applies to it); it too
+    // forwards the game's draw when it declines.
+    if (g_state->headLockThisDraw) {
+        g_state->headLockThisDraw = false;
+        const bool layered = uiLayer && uiLayerBegin(self);
+        const bool swallowed = onFootLookDrawHeadLocked(self, g_state->realDraw);
+        if (layered) uiLayerEnd(self);
+        if (swallowed) {
+            g_state->curveThisDraw = false;
+            return;
+        }
+    }
     if (g_state->curveThisDraw) {
         g_state->curveThisDraw = false;
         const bool layered = uiLayer && uiLayerBegin(self);

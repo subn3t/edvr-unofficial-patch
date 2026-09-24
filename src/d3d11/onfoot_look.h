@@ -71,4 +71,31 @@ void onFootLookStateCleared();
 
 void onFootLookFrameBoundary();
 
+// HEAD-LOCKED VIEW (experimental.onfoot_head_locked, with the head look on)
+//
+// With the camera turned by the head, the panel's image is right for where
+// the head looks, but the game still pastes it onto a screen hanging in
+// front of the seat. This draws it instead where it belongs: in each eye's
+// own frame, at exactly the angles the game rendered it (the main
+// projection's tangents), so it sits at infinity, 1:1, and turns with the
+// head -- a window the size of the game's field of view, black around it.
+//
+// The eye's frame comes from the composite's own clip transform (b1 at 4320,
+// by columns: the eye's projection times its view): its w row is the eye's
+// forward axis, its x and y rows less their forward part the right and up
+// axes. The game's pixel shader, texture, sampler and blend draw it; only
+// the vertex shader (one quad from SV_VertexID) and the depth test are ours,
+// put back after the draw.
+typedef void(__stdcall* OnFootDrawFn)(ID3D11DeviceContext*, unsigned int, unsigned int);
+
+namespace detail {
+extern bool g_onFootHeadLocked;
+}  // namespace detail
+inline bool onFootLookHeadLockedWanted() { return detail::g_onFootLookEnabled && detail::g_onFootHeadLocked; }
+
+// At the panel composite draw into an eye (vscreen's panel recognition).
+// True: drawn head-locked, the game's draw must be swallowed. False: nothing
+// drawn, forward the game's own (a screen, never a missing view).
+bool onFootLookDrawHeadLocked(ID3D11DeviceContext* ctx, OnFootDrawFn draw);
+
 }  // namespace edvr
