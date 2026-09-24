@@ -931,7 +931,17 @@ void DiagFrame() {
 // --- the on-foot stereo's eyes: the work ------------------------------------
 
 // The eye offset of a pipeline along the camera's right axis, metres.
-double PipeOffset(int pipe) { return pipe == g_leftPipe ? -g_halfIpd : g_halfIpd; }
+// experimental.onfoot_stereo_anchor: which point of the head the game's
+// camera stands for. The centre (0) puts the eyes half the IPD either side
+// of it. The game aims down sights by putting the sights on its camera, so
+// with the centre the sights sit before the nose; anchored on the right eye
+// (+1) or the left (-1), that eye is the camera -- it sees exactly what the
+// flat game shows -- and the other is a whole IPD away.
+int g_anchor = 0;
+double PipeOffset(int pipe) {
+    const double base = pipe == g_leftPipe ? -g_halfIpd : g_halfIpd;
+    return base - g_anchor * g_halfIpd;
+}
 
 // rows (by rows, turned): sx to move by, or 0 when not the main camera -- a
 // centred perspective with the main aspect and the main near plane (the main
@@ -1273,6 +1283,12 @@ void onFootLookConfigure(Config& cfg) {
         Log::get().note("onfoot stereo: view-space draws (the body, what it holds) take %.2f of the eye offset.",
                         nearClamped);
     g_nearEye = nearClamped;
+    const std::string anchorName = cfg.getString("experimental.onfoot_stereo_anchor", "centre");
+    const int anchor = anchorName == "right" ? 1 : (anchorName == "left" ? -1 : 0);
+    if (anchor != g_anchor)
+        Log::get().note("onfoot stereo: the game's camera is your %s.",
+                        anchor > 0 ? "right eye" : (anchor < 0 ? "left eye" : "head's centre, between the eyes"));
+    g_anchor = anchor;
     if (!on) {
         if (g_stereoWasOn) setOnFootFlat(false, 0, 0);
         g_stereoOn = g_stereoWasOn = false;
