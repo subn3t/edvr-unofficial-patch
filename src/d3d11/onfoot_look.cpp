@@ -16,6 +16,7 @@
 #include "camera_hunt.h"
 #include "draw_census.h"
 #include "journal_watch.h"
+#include "mem_probe.h"
 #include "stereo_mode_probe.h"
 #include "vscreen.h"
 
@@ -1372,6 +1373,7 @@ void onFootLookConfigure(Config& cfg) {
                         match ? "through the world's projection" : "as the game draws it");
     g_matchFov = match;
     cameraHuntConfigure(cfg);
+    memProbeConfigure(cfg);
     const std::string skip = cfg.getString("experimental.onfoot_head_look_skip", "");
     unsigned mask = 0;
     const struct {
@@ -1533,6 +1535,7 @@ void onFootLookStateCleared() {
 }
 
 void onFootLookFrameBoundary() {
+    memProbeFrame();
     if (!detail::g_onFootLookEnabled) return;
     ++g_frames;
     if (g_stereoDiag) DiagFrame();

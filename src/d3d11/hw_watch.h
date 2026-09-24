@@ -5,7 +5,8 @@
 // registers are set, and threads born later are armed by the next sweep. The
 // caller installs its own vectored handler, which sees EXCEPTION_SINGLE_STEP
 // with DR6 bit 1..3 set for slot 0..2, and clears those bits. One user at a
-// time: stereo_mode_probe.cpp's feature watch and camera_hunt.cpp's hunt.
+// time: stereo_mode_probe.cpp's feature watch, camera_hunt.cpp's hunt and
+// mem_probe.cpp's watch.
 #pragma once
 
 #include <windows.h>
@@ -15,8 +16,9 @@
 namespace edvr {
 
 // addr[i] 0 leaves slot i off; len[i] 1, 2, 4 or 8 bytes, the address
-// aligned to it. Arms every current thread; the count armed.
-int hwWatchArm(const uintptr_t addr[3], const uint8_t len[3]);
+// aligned to it; reads[i] (optional) traps reads too. Arms every current
+// thread; the count armed.
+int hwWatchArm(const uintptr_t addr[3], const uint8_t len[3], const bool reads[3] = nullptr);
 
 // Arms threads created since the last arm or sweep.
 void hwWatchSweep();

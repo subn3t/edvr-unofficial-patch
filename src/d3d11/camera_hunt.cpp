@@ -442,6 +442,8 @@ void cameraHuntConfigure(Config& cfg) {
     g_wanted = want;
 }
 
+bool cameraHuntWatching() { return g_stage == Stage::Watching; }
+
 void cameraHuntFrame(const float* raw12) {
     if (g_stage == Stage::Off || g_stage == Stage::Done) return;
     const ULONGLONG now = GetTickCount64();
