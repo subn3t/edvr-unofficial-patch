@@ -558,7 +558,7 @@ namespace {
 constexpr uintptr_t kStoreRva = 0x281B052u;
 constexpr uint8_t kStoreBytes[9] = {0x8B, 0x40, 0x20, 0x89, 0x81, 0x98, 0x36, 0x00, 0x00};  // from +0x281B04F
 uint8_t* g_stereoStub = nullptr;
-volatile uint8_t* g_stereoData = nullptr;  // +0 flag, +4 substitutions
+volatile uint8_t* g_stereoData = nullptr;  // +0 flag, +4 substitutions, +8 the function's rsi
 bool g_stereoTried = false, g_stereoPatched = false;
 uint32_t g_stereoLastCount = 0;
 // Frame boundaries since the stub last put a 3 where the game asked for 5.
@@ -567,6 +567,68 @@ uint32_t g_stereoLastCount = 0;
 // still holds the last session's Embark (flight of 2026-09-24 15:36).
 uint32_t g_quietFrames = ~0u;
 bool g_swapWanted = false;
+
+// THE LOAD-IN KICK (experimental.onfoot_stereo_kick). Loaded straight onto a
+// planet, the game renders on foot but does not ask for its on-foot display
+// mode until the camera's state changes -- a sprint, 47 s after LoadGame in
+// the flight of 2026-09-24 17:18 -- and until it asks, the eye pipelines
+// render at the headset's size and the stereo stays off. The request is
+// X->[0x20], X = [rsi+0x7F8] in the function the stub sits in (+0x281B04F
+// reads it). With Status.json saying on foot for three seconds and no request
+// yet, 5 is written there once, as the game itself would; only within 15 s of
+// the on-foot flag rising, so a later external camera (which the flag also
+// covers) is never touched. Each change of the request is logged.
+bool g_kickWanted = true;
+bool g_footWas = false, g_kickedThisStretch = false, g_substitutedThisStretch = false;
+ULONGLONG g_footSinceMs = 0;
+uint32_t g_modeWas = ~0u;
+int g_modeLogs = 0;
+
+__declspec(noinline) bool sehWrite32(uintptr_t a, uint32_t v) noexcept {
+    __try {
+        if (!a) return false;
+        *reinterpret_cast<volatile uint32_t*>(a) = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+uintptr_t RequestAddr() {
+    const uintptr_t self = *reinterpret_cast<volatile const uintptr_t*>(g_stereoData + 8);
+    const uintptr_t x = sehRead64(self ? self + 0x7F8 : 0);
+    return x ? x + 0x20 : 0;
+}
+
+void KickFrame(bool substituted) {
+    const uintptr_t at = RequestAddr();
+    uint32_t mode = ~0u;
+    if (at && !sehCopy(&mode, at, 4)) mode = ~0u;
+    const bool foot = journalOnFootKnown() && journalOnFoot();
+    if (mode != g_modeWas && g_modeLogs < 40) {
+        ++g_modeLogs;
+        Log::get().note("onfoot stereo: the game's requested display mode %d -> %d (Status.json: %s).",
+                        static_cast<int>(g_modeWas), static_cast<int>(mode),
+                        !journalOnFootKnown() ? "unknown" : (foot ? "on foot" : "not on foot"));
+    }
+    g_modeWas = mode;
+    const ULONGLONG now = GetTickCount64();
+    if (foot && !g_footWas) {
+        g_footSinceMs = now;
+        g_kickedThisStretch = g_substitutedThisStretch = false;
+    }
+    g_footWas = foot;
+    if (substituted) g_substitutedThisStretch = true;
+    if (!g_kickWanted || !*g_stereoData || !foot || g_kickedThisStretch || g_substitutedThisStretch || mode != 3)
+        return;
+    const ULONGLONG since = now - g_footSinceMs;
+    if (since < 3000 || since > 15000) return;
+    g_kickedThisStretch = true;
+    if (sehWrite32(at, 5))
+        Log::get().note("onfoot stereo: on foot per Status.json for %.1f s and the game still asks for mode 3; asked "
+                        "for its on-foot mode (5) in its place (the load-in kick).",
+                        since / 1000.0);
+}
 
 void InstallStereoPatch() {
     g_stereoTried = true;
@@ -587,21 +649,26 @@ void InstallStereoPatch() {
         return;
     }
     const uintptr_t st = reinterpret_cast<uintptr_t>(stub), dt = reinterpret_cast<uintptr_t>(data);
-    uint8_t code[0x24] = {
-        0x80, 0x3D, 0, 0, 0, 0, 0x00,  // 00 cmp byte ptr [rip+flag],0
-        0x74, 0x10,                    // 07 je 19
-        0x83, 0xF8, 0x05,              // 09 cmp eax,5
-        0x75, 0x0B,                    // 0C jne 19
-        0xB8, 0x03, 0x00, 0x00, 0x00,  // 0E mov eax,3
-        0xFF, 0x05, 0, 0, 0, 0,        // 13 inc dword ptr [rip+count]
-        0x89, 0x81, 0x98, 0x36, 0x00, 0x00,  // 19 mov [rcx+3698h],eax
-        0xE9, 0, 0, 0, 0};             // 1F jmp back
-    const int32_t flagDisp = static_cast<int32_t>(static_cast<intptr_t>(dt) - static_cast<intptr_t>(st + 0x07));
-    const int32_t countDisp = static_cast<int32_t>(static_cast<intptr_t>(dt + 4) - static_cast<intptr_t>(st + 0x19));
-    const int32_t backDisp = static_cast<int32_t>(static_cast<intptr_t>(site + 6) - static_cast<intptr_t>(st + 0x24));
-    std::memcpy(code + 0x02, &flagDisp, 4);
-    std::memcpy(code + 0x15, &countDisp, 4);
-    std::memcpy(code + 0x20, &backDisp, 4);
+    // rsi is the function's own object: [rsi+7F8h] the one whose +20h holds
+    // the requested mode (the load-in kick reads and writes it), [rsi+50h] P.
+    uint8_t code[0x2B] = {
+        0x48, 0x89, 0x35, 0, 0, 0, 0,  // 00 mov [rip+rsi],rsi
+        0x80, 0x3D, 0, 0, 0, 0, 0x00,  // 07 cmp byte ptr [rip+flag],0
+        0x74, 0x10,                    // 0E je 20
+        0x83, 0xF8, 0x05,              // 10 cmp eax,5
+        0x75, 0x0B,                    // 13 jne 20
+        0xB8, 0x03, 0x00, 0x00, 0x00,  // 15 mov eax,3
+        0xFF, 0x05, 0, 0, 0, 0,        // 1A inc dword ptr [rip+count]
+        0x89, 0x81, 0x98, 0x36, 0x00, 0x00,  // 20 mov [rcx+3698h],eax
+        0xE9, 0, 0, 0, 0};             // 26 jmp back
+    const int32_t rsiDisp = static_cast<int32_t>(static_cast<intptr_t>(dt + 8) - static_cast<intptr_t>(st + 0x07));
+    const int32_t flagDisp = static_cast<int32_t>(static_cast<intptr_t>(dt) - static_cast<intptr_t>(st + 0x0E));
+    const int32_t countDisp = static_cast<int32_t>(static_cast<intptr_t>(dt + 4) - static_cast<intptr_t>(st + 0x20));
+    const int32_t backDisp = static_cast<int32_t>(static_cast<intptr_t>(site + 6) - static_cast<intptr_t>(st + 0x2B));
+    std::memcpy(code + 0x03, &rsiDisp, 4);
+    std::memcpy(code + 0x09, &flagDisp, 4);
+    std::memcpy(code + 0x1C, &countDisp, 4);
+    std::memcpy(code + 0x27, &backDisp, 4);
     std::memcpy(stub, code, sizeof(code));
     DWORD old = 0;
     if (!VirtualProtect(stub, 4096, PAGE_EXECUTE_READ, &old) ||
@@ -650,9 +717,11 @@ void StereoFrame() {
     const uint32_t count = *reinterpret_cast<volatile const uint32_t*>(g_stereoData + 4);
     if (count && !g_stereoLastCount)
         Log::get().note("onfoot stereo: the game asked for HMD Cinema (5); kept at HMD stereo (3).");
-    if (count != g_stereoLastCount) g_quietFrames = 0;
+    const bool substituted = count != g_stereoLastCount;
+    if (substituted) g_quietFrames = 0;
     else if (g_quietFrames != ~0u) ++g_quietFrames;
     g_stereoLastCount = count;
+    KickFrame(substituted);
     // Each image to the other eye (onfoot_stereo_swap_eyes) while on foot.
     setEyeSwap(g_swapWanted && onFootStereoWanted());
 }
@@ -675,6 +744,9 @@ void stereoModeProbeConfigure(Config& cfg) {
         *g_stereoData = want;
     }
     g_watchWanted = cfg.getBool("experimental.stereo_mode_watch", false);
+    const bool kick = cfg.getBool("experimental.onfoot_stereo_kick", true);
+    if (kick != g_kickWanted) Log::get().note("onfoot stereo: load-in kick %s.", kick ? "on" : "off");
+    g_kickWanted = kick;
     const bool swap = cfg.getBool("experimental.onfoot_stereo_swap_eyes", false);
     if (swap != g_swapWanted)
         Log::get().note("onfoot stereo: eyes %s on foot (live).", swap ? "SWAPPED" : "as the game submits them");
