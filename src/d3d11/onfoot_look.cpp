@@ -52,6 +52,19 @@ bool g_haveMain = false;
 double g_mainScale[2] = {}, g_mainNear = 0;
 bool g_mainCentred = false;  // the x row has no forward part: a flat view, not an eye's asymmetric one
 
+// THE MAIN PROJECTION IS THE WIDEST. It was the first G-buffer draw's, until
+// the aim-down-sights capture of 2026-09-24: aiming, the frame's first
+// G-buffer draw is the gun, through its own narrower projection (x 2.10
+// against the world's 1.15), and the world became "another camera" -- the
+// sky's copies unturned (the black bar back), the placed window the gun's
+// size. Every G-buffer draw's b0, as the game wrote it, is weighed instead;
+// the widest is the world's, and it holds from the next frame.
+float g_viewRaw[16] = {};
+bool g_viewRawFresh = false;
+bool g_haveCand = false, g_candCentred = false;
+double g_candScale[2] = {}, g_candNear = 0;
+uint32_t g_mainLogs = 0;
+
 // Per-frame learning, and whether the panel scene ran last frame (the turn
 // is armed only then: in the cockpit the G-buffer is eye-sized).
 bool g_foundThisFrame = false;
@@ -114,6 +127,7 @@ uint64_t g_anyFrame = 0, g_scaled = 0, g_masks = 0, g_pendingFull = 0, g_ambiguo
 uint64_t g_lockDrawn = 0, g_lockDeclined = 0, g_lockWarped = 0, g_hudScaled = 0;
 double g_lockWarpMaxDeg = 0;
 float g_hudScale = 1.0f;  // experimental.onfoot_hud_scale
+bool g_matchFov = true;   // experimental.onfoot_match_fov
 const char* g_lockWhy = "";
 double g_lastYaw = 0, g_lastPitch = 0, g_lastRoll = 0;
 ULONGLONG g_lastReport = 0;
@@ -311,8 +325,11 @@ bool TurnSameCamera(float* rows) {
     if (sx < 1e-6 || sy < 1e-6 || sw < 1e-6) return false;
     const double aspect = g_mainScale[0] / g_mainScale[1];
     if (!Near(sx / sy, aspect, 5e-3 * aspect)) return false;
-    // The z row stays (0, 0, 0, near) whatever the model scale.
+    // The z row stays (0, 0, 0, near) whatever the model scale; so does the
+    // field (the x scale over the model scale). A narrower field is the
+    // view model's (MatchFov), which stays with the head as it always has.
     if (!Near(rows[11], g_mainNear, 0.02 * g_mainNear)) return false;
+    if (!Near(sx / sw, g_mainScale[0], 0.02 * g_mainScale[0])) return false;
     if (!Armed() || !RotateRows(rows)) return false;
     ++g_turnedOthers;
     return true;
@@ -335,10 +352,42 @@ bool ScaleHud(float* rows) {
     return true;
 }
 
+// THE VIEW MODEL (experimental.onfoot_match_fov). The first-person body,
+// what it holds and the helmet HUD are drawn from the camera through
+// narrower projections than the world's -- at the hip x 1.294 against the
+// world's 0.5625 at the widest FOV setting, aiming down sights 2.10 against
+// 1.15 (the censuses of 2026-09-24) -- so on a flat screen they look bigger
+// and nearer than they are. In the headset the world is 1:1, so they are
+// drawn through the world's projection: their x and y rows scaled by the
+// world's x scale over theirs, then by onfoot_hud_scale (1: as the world).
+// The field set by eye before this was found, hud_scale 0.5, was 0.435's
+// approximation.
+bool MatchFov(float* rows) {
+    if (!g_matchFov) return ScaleHud(rows);
+    if (!g_haveMain || !g_panelLastFrame || !g_mainCentred) return false;
+    if (onFootStereoHolding() && !onFootStereoWanted()) return false;
+    const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
+    if (sx < 1e-6 || sy < 1e-6 || sw < 1e-6) return false;
+    const double aspect = g_mainScale[0] / g_mainScale[1];
+    if (!Near(sx / sy, aspect, 5e-3 * aspect)) return false;
+    if (std::fabs(rows[8]) > 1e-4 || std::fabs(rows[9]) > 1e-4 || std::fabs(rows[10]) > 1e-4 || rows[11] <= 0)
+        return false;
+    const double sxn = sx / sw;
+    if (sxn < 1.02 * g_mainScale[0]) return false;
+    const double dot = double(rows[0]) * rows[12] + double(rows[1]) * rows[13] + double(rows[2]) * rows[14];
+    if (std::fabs(dot) > 1e-3 * sx * sw) return false;
+    const double k = g_mainScale[0] / sxn * g_hudScale;
+    for (int i = 0; i < 8; ++i) rows[i] = static_cast<float>(rows[i] * k);
+    ++g_hudScaled;
+    return true;
+}
+
 // b0 at 64: the view's clip rows.
 void TurnView(float* a) {
     if (!IsMainView(a)) {
-        if (!TurnSameCamera(a) && !ScaleHud(a)) ++g_otherViews;
+        const bool turned = TurnSameCamera(a);
+        const bool matched = MatchFov(a);
+        if (!turned && !matched) ++g_otherViews;
         return;
     }
     if (Skipped(kPartView) || !Armed() || !RotateRows(a)) return;
@@ -377,7 +426,9 @@ bool TurnClip(float* c) {
     for (int r = 0; r < 4; ++r)
         for (int col = 0; col < 4; ++col) rows[4 * r + col] = c[4 * col + r];
     if (!IsMainView(rows)) {
-        if (TurnSameCamera(rows) || ScaleHud(rows))
+        const bool turned = TurnSameCamera(rows);
+        const bool matched = MatchFov(rows);
+        if (turned || matched)
             for (int r = 0; r < 4; ++r)
                 for (int col = 0; col < 4; ++col) c[4 * col + r] = rows[4 * r + col];
         return false;
@@ -581,23 +632,42 @@ void Learn() {
                         dv.ByteWidth, df.ByteWidth, g_panelW, g_panelH);
         return;  // the shadow is of another buffer's writes; next frame
     }
-    if (!g_viewShadowFresh) return;
-    // The rows this draw uses are the last b0 write: the main view's. A turn
-    // keeps the row lengths, so turned rows name the same projection.
-    const float* z = g_viewShadow + 8;
+}
+
+// A G-buffer draw's b0 as the game wrote it: a candidate for the main view.
+// Any perspective (a (0, 0, 0, near) z row), normalised by its model scale.
+void ConsiderMain(const float* rows) {
+    const double sw = RowLength(rows + 12);
+    if (sw < 1e-6) return;
+    const float* z = rows + 8;
     if (std::fabs(z[0]) > 1e-4 || std::fabs(z[1]) > 1e-4 || std::fabs(z[2]) > 1e-4 || z[3] <= 1e-6) return;
-    const bool had = g_haveMain;
-    g_mainScale[0] = RowLength(g_viewShadow);
-    g_mainScale[1] = RowLength(g_viewShadow + 4);
-    g_mainNear = z[3];
+    const double lx = RowLength(rows), sx = lx / sw, sy = RowLength(rows + 4) / sw;
+    if (sx < 1e-6 || sy < 1e-6) return;
+    if (g_haveCand && sx >= g_candScale[0]) return;
+    const double xw = double(rows[0]) * rows[12] + double(rows[1]) * rows[13] + double(rows[2]) * rows[14];
+    g_haveCand = true;
+    g_candScale[0] = sx;
+    g_candScale[1] = sy;
+    g_candNear = z[3];
+    g_candCentred = std::fabs(xw) < 1e-3 * lx * sw;
+}
+
+// The frame's widest, for the frames that follow.
+void CommitMain() {
+    if (!g_haveCand) return;
+    g_haveCand = false;
+    const bool changed = !g_haveMain || !Near(g_candScale[0], g_mainScale[0], 0.02 * g_mainScale[0]) ||
+                         !Near(g_candNear, g_mainNear, 0.02 * g_mainNear) || g_candCentred != g_mainCentred;
+    g_mainScale[0] = g_candScale[0];
+    g_mainScale[1] = g_candScale[1];
+    g_mainNear = g_candNear;
+    g_mainCentred = g_candCentred;
     g_haveMain = true;
-    const double wl = RowLength(g_viewShadow + 12);
-    const double xw = double(g_viewShadow[0]) * g_viewShadow[12] + double(g_viewShadow[1]) * g_viewShadow[13] +
-                      double(g_viewShadow[2]) * g_viewShadow[14];
-    g_mainCentred = wl > 1e-6 && std::fabs(xw) < 1e-3 * g_mainScale[0] * wl;
-    if (!had)
-        Log::get().note("onfoot look: main view projection x %.4f y %.4f near %.4g.", g_mainScale[0], g_mainScale[1],
-                        g_mainNear);
+    if (changed && g_mainLogs < 60) {
+        ++g_mainLogs;
+        Log::get().note("onfoot look: main view projection x %.4f y %.4f near %.4g%s (the widest G-buffer view).",
+                        g_mainScale[0], g_mainScale[1], g_mainNear, g_mainCentred ? "" : ", off-centre: not armed");
+    }
 }
 
 void Report() {
@@ -621,7 +691,7 @@ void Report() {
                     "left alone); copies turned: %llu in any frame, %llu scaled, %llu shadow masks, in "
                     "%llu scanned writes (%llu missed, every pending slot taken); %llu without a head pose, %llu "
                     "off-centre, %llu frames with the identity camera; head-locked view: %llu drawn, %llu declined%s%s%s, "
-                    "%llu timewarped (largest %.2f degrees); %llu HUD views scaled; "
+                    "%llu timewarped (largest %.2f degrees); %llu view-model views matched to the world's field; "
                     "stereo: %s, %llu camera writes moved (%llu in view space, x%.2f), %llu written again for the other eye (%llu failed, %llu "
                     "not discards), %llu new eye targets, left eye = %s pipeline%s, half IPD %.2f mm; "
                     "head yaw %.1f pitch %.1f roll %.1f.",
@@ -944,9 +1014,14 @@ double PipeOffset(int pipe) {
     return base - g_anchor * g_halfIpd;
 }
 
-// rows (by rows, turned): sx to move by, or 0 when not the main camera -- a
-// centred perspective with the main aspect and the main near plane (the main
-// view, the same camera through a model), or the helmet HUD's nearer one.
+// rows (by rows, turned and matched): sx to move by, or 0 when not a view
+// of this camera -- a centred perspective with the main aspect, whatever its
+// near plane and field: the world, the same camera through a model, the view
+// model, the HUD and the holograms, all from the same eye. (The first flights
+// moved only the main near plane and the helmet HUD's; the gun's ammo
+// hologram, drawn at a 0.1 near plane through the world's field, stayed at
+// the centre in both eyes.) Part "hudeye" leaves those off the main near
+// plane at the centre.
 double MoveScale(const float* rows) {
     if (!g_haveMain) return 0;
     const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
@@ -955,9 +1030,7 @@ double MoveScale(const float* rows) {
     if (!Near(sx / sy, aspect, 5e-3 * aspect)) return 0;
     if (std::fabs(rows[8]) > 1e-4 || std::fabs(rows[9]) > 1e-4 || std::fabs(rows[10]) > 1e-4 || rows[11] <= 0)
         return 0;
-    const bool mainNear = Near(rows[11], g_mainNear, 0.02 * g_mainNear);
-    const bool hud = !mainNear && !Skipped(kPartHudEye) && Near(sw, 1, 1e-3) && sx > 1.1 * g_mainScale[0];
-    if (!mainNear && !hud) return 0;
+    if (Skipped(kPartHudEye) && !Near(rows[11], g_mainNear, 0.02 * g_mainNear)) return 0;
     const double dot = double(rows[0]) * rows[12] + double(rows[1]) * rows[13] + double(rows[2]) * rows[14];
     if (std::fabs(dot) > 1e-3 * sx * sw) return 0;
     return sx / sw;
@@ -1262,6 +1335,11 @@ void onFootLookConfigure(Config& cfg) {
     const float hudClamped = hud < 0.3f ? 0.3f : (hud > 1.5f ? 1.5f : hud);
     if (hudClamped != g_hudScale) Log::get().note("onfoot look: helmet HUD drawn at %.2f of its size.", hudClamped);
     g_hudScale = hudClamped;
+    const bool match = cfg.getBool("experimental.onfoot_match_fov", true);
+    if (match != g_matchFov)
+        Log::get().note("onfoot look: the view model (body, gun, HUD) drawn %s.",
+                        match ? "through the world's projection" : "as the game draws it (onfoot_hud_scale scales it)");
+    g_matchFov = match;
     const std::string skip = cfg.getString("experimental.onfoot_head_look_skip", "");
     unsigned mask = 0;
     const struct {
@@ -1309,8 +1387,12 @@ void onFootLookBeforeDraw(ID3D11DeviceContext* ctx) {
     ++g_drawOrdinal;
     if (g_stereoDiag) DiagDraw();
     if (g_stereoOn && ctx) StereoDraw(ctx);
-    if (g_foundThisFrame) return;
     if (!PanelGBufferBound()) return;
+    if (g_viewRawFresh && bindingGet(BindSlot::VsCb0) == g_viewCb) {
+        g_viewRawFresh = false;
+        ConsiderMain(g_viewRaw);
+    }
+    if (g_foundThisFrame) return;
     g_foundThisFrame = true;
     Learn();
 }
@@ -1358,7 +1440,9 @@ void onFootLookBeforeUnmap(ID3D11Resource* res) {
     if (res == g_viewCb && g_viewData) {
         float* a = reinterpret_cast<float*>(static_cast<char*>(g_viewData) + kViewOffset);
         float before[16];
-        if (g_stereoOn) memcpy(before, a, sizeof(before));
+        memcpy(before, a, sizeof(before));
+        memcpy(g_viewRaw, before, sizeof(g_viewRaw));
+        g_viewRawFresh = true;
         TurnView(a);
         memcpy(g_viewShadow, a, sizeof(g_viewShadow));
         g_viewShadowFresh = true;
@@ -1413,6 +1497,7 @@ void onFootLookFrameBoundary() {
     if (g_foundThisFrame) ++g_panelFrames;
     g_panelLastFrame = g_foundThisFrame;
     g_foundThisFrame = false;
+    CommitMain();
     // The capture: the frame that just ended, then (on the census key's rising
     // edge, on foot) the next one.
     if (g_capFile) CapEnd();
