@@ -465,6 +465,8 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\panel_curve.cpp" "src\d3d11\screen_motion.cpp" "src\d3d11\weapon_motion.cpp" ^
     "src\d3d11\onfoot_look.cpp" ^
     "src\d3d11\stereo_mode_probe.cpp" ^
+    "src\d3d11\hw_watch.cpp" ^
+    "src\d3d11\camera_hunt.cpp" ^
     "src\d3d11\shader_sig.cpp" ^
     "src\d3d11\remlok_fix.cpp" "src\d3d11\holo_fix.cpp" ^
     "src\d3d11\target_sharp.cpp" "src\d3d11\night_vision.cpp" ^

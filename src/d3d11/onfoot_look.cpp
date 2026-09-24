@@ -13,6 +13,7 @@
 #include "../common/guard.h"
 #include "../common/log.h"
 #include "binding_shadow.h"
+#include "camera_hunt.h"
 #include "draw_census.h"
 #include "journal_watch.h"
 #include "stereo_mode_probe.h"
@@ -37,6 +38,11 @@ constexpr UINT kClipOffset = 4320;  // b1: cb1[270..273], the same transform by 
 // field); kept out of the scan, where a still camera's would pass for R^T.
 constexpr UINT kPrevPoseOffset = 3728;
 constexpr UINT kFrameMinBytes = kClipOffset + 64;
+// b1: the camera's rotation by rows (right, up, forward; float4 each), as the
+// game wrote it -- what camera_hunt.h looks for in the game's memory.
+constexpr UINT kCamRowsOffset = 4432;
+float g_rawCam[12] = {};
+bool g_rawCamValid = false;
 
 ID3D11Buffer* g_viewCb = nullptr;   // learned b0 (our reference, so the address is not reused)
 ID3D11Buffer* g_frameCb = nullptr;  // learned b1 (ditto)
@@ -1365,6 +1371,7 @@ void onFootLookConfigure(Config& cfg) {
         Log::get().note("onfoot look: the view model (body, what it holds) drawn %s.",
                         match ? "through the world's projection" : "as the game draws it");
     g_matchFov = match;
+    cameraHuntConfigure(cfg);
     const std::string skip = cfg.getString("experimental.onfoot_head_look_skip", "");
     unsigned mask = 0;
     const struct {
@@ -1480,6 +1487,16 @@ void onFootLookBeforeUnmap(ID3D11Resource* res) {
         // in ordinary memory and written back whole (see TurnBuffer).
         static float work[kMaxScanBytes / 4];
         memcpy(work, g_frameData, g_frameFloats * 4);
+        if (!g_rawCamValid && g_frameFloats * 4 >= kCamRowsOffset + 48) {
+            float clip[16];
+            const float* c = work + kClipOffset / 4;
+            for (int r = 0; r < 4; ++r)
+                for (int col = 0; col < 4; ++col) clip[4 * r + col] = c[4 * col + r];
+            if (IsMainView(clip)) {
+                memcpy(g_rawCam, work + kCamRowsOffset / 4, sizeof(g_rawCam));
+                g_rawCamValid = true;
+            }
+        }
         bool viewSpace = false;
         if (g_stereoOn) {
             float rows[16];
@@ -1523,6 +1540,9 @@ void onFootLookFrameBoundary() {
     g_panelLastFrame = g_foundThisFrame;
     g_foundThisFrame = false;
     CommitMain();
+    cameraHuntFrame(g_rawCamValid && g_panelLastFrame && (!onFootStereoHolding() || onFootStereoWanted()) ? g_rawCam
+                                                                                                          : nullptr);
+    g_rawCamValid = false;
     // The capture: the frame that just ended, then (on the census key's rising
     // edge, on foot) the next one.
     if (g_capFile) CapEnd();

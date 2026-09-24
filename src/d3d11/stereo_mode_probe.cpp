@@ -13,6 +13,7 @@
 #include "../common/config.h"
 #include "../common/frame_flag.h"
 #include "../common/log.h"
+#include "hw_watch.h"
 #include "journal_watch.h"
 
 namespace edvr {
@@ -338,8 +339,6 @@ bool g_watchArmed = false, g_watchDone = false, g_watchWanted = false;
 ULONGLONG g_watchArmedMs = 0, g_watchSweepMs = 0;
 PVOID g_watchVeh = nullptr;
 uint64_t g_gameSize = 0;
-DWORD g_armedTids[512];
-int g_armedTidCount = 0;
 
 constexpr int kMaxFrames = 14, kMaxHits = 48;
 struct Hit {
@@ -356,42 +355,8 @@ volatile LONG g_hitCount = 0, g_hitsLogged = 0, g_hitsDropped = 0, g_hitsSame = 
 // value (a per-frame re-apply) is counted, not recorded.
 volatile uint8_t g_lastValue[kWatchSlots] = {0xFF, 0xFF, 0xFF};
 
-__declspec(noinline) uint32_t unwindGame(const CONTEXT& start, uint32_t* out, uint32_t cap) noexcept {
-    CONTEXT c = start;
-    uint32_t found = 0;
-    for (uint32_t step = 0; step < 40 && found < cap; ++step) {
-        if (!c.Rip) break;
-        DWORD64 imageBase = 0;
-        PRUNTIME_FUNCTION function = nullptr;
-        __try {
-            function = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            break;
-        }
-        const DWORD64 oldRip = c.Rip, oldRsp = c.Rsp;
-        if (function) {
-            DWORD64 establisher = 0;
-            PVOID handlerData = nullptr;
-            __try {
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, function, &c, &handlerData, &establisher,
-                                 nullptr);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                break;
-            }
-        } else {
-            uintptr_t next = 0;
-            __try {
-                next = *reinterpret_cast<const uintptr_t*>(c.Rsp);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                break;
-            }
-            c.Rip = next;
-            c.Rsp += sizeof(uintptr_t);
-        }
-        if (c.Rsp <= oldRsp || c.Rip == oldRip) break;
-        if (c.Rip >= g_base && c.Rip < g_base + g_gameSize) out[found++] = static_cast<uint32_t>(c.Rip - g_base);
-    }
-    return found;
+uint32_t unwindGame(const CONTEXT& start, uint32_t* out, uint32_t cap) noexcept {
+    return unwindGameStack(start, g_base, g_gameSize, out, cap);
 }
 
 LONG CALLBACK WatchVeh(EXCEPTION_POINTERS* ep) {
@@ -424,86 +389,8 @@ LONG CALLBACK WatchVeh(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-// Dr7 for slots 1..3: local enable (bit 2i), RW = 01 (write) at 16+4i,
-// LEN = 00 (one byte) at 18+4i. Other bits pass through.
-DWORD64 ComposeDr7(DWORD64 dr7, bool arm) {
-    for (int i = 1; i <= kWatchSlots; ++i) {
-        dr7 &= ~(DWORD64(1) << (2 * i));
-        dr7 &= ~(DWORD64(0xF) << (16 + 4 * i));
-        if (arm && g_watchAddr[i - 1]) dr7 |= (DWORD64(1) << (2 * i)) | (DWORD64(1) << (16 + 4 * i));
-    }
-    return dr7;
-}
-
-bool SetThreadWatch(DWORD tid, bool arm) {
-    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
-    if (!h) return false;
-    bool ok = false;
-    if (SuspendThread(h) != static_cast<DWORD>(-1)) {
-        CONTEXT ctx{};
-        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-        if (GetThreadContext(h, &ctx)) {
-            ctx.Dr7 = ComposeDr7(ctx.Dr7, arm);
-            if (arm) {
-                ctx.Dr1 = g_watchAddr[0];
-                ctx.Dr2 = g_watchAddr[1];
-                ctx.Dr3 = g_watchAddr[2];
-            }
-            ok = SetThreadContext(h, &ctx) != FALSE;
-        }
-        ResumeThread(h);
-    }
-    CloseHandle(h);
-    return ok;
-}
-
-struct SelfArgs {
-    DWORD tid;
-    bool arm;
-};
-DWORD WINAPI SelfWatchProc(LPVOID p) {
-    SelfArgs* a = static_cast<SelfArgs*>(p);
-    SetThreadWatch(a->tid, a->arm);
-    delete a;
-    return 0;
-}
-
-bool SetWatchOn(DWORD tid, bool arm) {
-    if (tid != GetCurrentThreadId()) return SetThreadWatch(tid, arm);
-    auto* a = new (std::nothrow) SelfArgs{tid, arm};
-    if (!a) return false;
-    HANDLE h = CreateThread(nullptr, 0, &SelfWatchProc, a, 0, nullptr);
-    if (!h) {
-        delete a;
-        return false;
-    }
-    WaitForSingleObject(h, 2000);
-    CloseHandle(h);
-    return true;
-}
-
-void SweepWatch() {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return;
-    THREADENTRY32 te{};
-    te.dwSize = sizeof(te);
-    const DWORD pid = GetCurrentProcessId();
-    if (Thread32First(snap, &te)) {
-        do {
-            if (te.th32OwnerProcessID != pid) continue;
-            bool have = false;
-            for (int i = 0; i < g_armedTidCount; ++i)
-                if (g_armedTids[i] == te.th32ThreadID) have = true;
-            if (have || g_armedTidCount >= 512) continue;
-            if (SetWatchOn(te.th32ThreadID, true)) g_armedTids[g_armedTidCount++] = te.th32ThreadID;
-        } while (Thread32Next(snap, &te));
-    }
-    CloseHandle(snap);
-}
-
 void DisarmWatch() {
-    for (int i = 0; i < g_armedTidCount; ++i) SetWatchOn(g_armedTids[i], false);
-    g_armedTidCount = 0;
+    hwWatchDisarm();
     g_watchArmed = false;
     g_watchDone = true;
 }
@@ -530,12 +417,13 @@ void ArmWatch(uintptr_t tgt) {
         g_watchDone = true;
         return;
     }
-    SweepWatch();
+    const uint8_t lens[kWatchSlots] = {1, 1, 1};
+    const int armed = hwWatchArm(g_watchAddr, lens);
     g_watchArmed = true;
     g_watchArmedMs = g_watchSweepMs = GetTickCount64();
     Log::get().note("stereo mode probe: write-watch armed on %d threads: Secondary Cinema %p, Secondary scene "
                     "feature 0 %p, Primary Cinema %p (enabled bytes).",
-                    g_armedTidCount, reinterpret_cast<void*>(g_watchAddr[0]), reinterpret_cast<void*>(g_watchAddr[1]),
+                    armed, reinterpret_cast<void*>(g_watchAddr[0]), reinterpret_cast<void*>(g_watchAddr[1]),
                     reinterpret_cast<void*>(g_watchAddr[2]));
 }
 
@@ -561,7 +449,7 @@ void WatchFrame(uintptr_t tgt) {
     }
     if (now - g_watchSweepMs > 2000) {
         g_watchSweepMs = now;
-        SweepWatch();
+        hwWatchSweep();
     }
     if (now - g_watchArmedMs > 900000 || g_hitCount >= kMaxHits) {
         DisarmWatch();
