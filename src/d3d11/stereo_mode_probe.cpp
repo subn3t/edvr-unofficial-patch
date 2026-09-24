@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 #include "../common/code_hook.h"
@@ -277,6 +278,49 @@ void TakeSnap(Snap& snap, uintptr_t tgt) {
     snap.valid = true;
 }
 
+// The render pipelines (the builder at +0x28A2AE4): R->[0x90] and R->[0x98],
+// type at +8 (0 Primary, 1 Secondary, 2 Thumbnail, 3 Auxiliary), size at
+// +0x320/+0x324, features at +0x270..+0x2F0, each with its enabled byte at
+// +0x20 and its owner at +0x18.
+constexpr const char* kFeatureNames[] = {
+    "DeferredShading?", "TiledMarch?", "?", "ReducedSize", "Forward", "Blur", "Restore", "DepthOfField", "Bloom",
+    "HDR", "AntiAliasing", "Scaling", "UI", "PostGUIDepthPass", "PostGUI", "Cinema", "DebugOverlay"};
+
+__declspec(noinline) uint8_t sehRead8(uintptr_t a) noexcept {
+    __try {
+        return a ? *reinterpret_cast<const uint8_t*>(a) : 0xFF;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0xFE;
+    }
+}
+
+__declspec(noinline) uint32_t sehRead32(uintptr_t a) noexcept {
+    __try {
+        return a ? *reinterpret_cast<const uint32_t*>(a) : 0xFFFFFFFFu;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0xFFFFFFFEu;
+    }
+}
+
+void LogPipelines(uintptr_t tgt, bool foot) {
+    const uintptr_t p = sehRead64(sehRead64(tgt + 0x248) + 0x1180);
+    const uintptr_t r = sehRead64(p ? p + 0x2CB8 : 0);
+    for (int k = 0; k < 2; ++k) {
+        const uintptr_t pl = sehRead64(r ? r + 0x90 + 8 * k : 0);
+        if (!pl) continue;
+        char line[1024];
+        int n = snprintf(line, sizeof(line), "stereo mode probe: %s pipeline R+0x%X %p type %u size %ux%u; enabled:",
+                         foot ? "on foot" : "in ship", 0x90 + 8 * k, reinterpret_cast<void*>(pl), sehRead32(pl + 8),
+                         sehRead32(pl + 0x320), sehRead32(pl + 0x324));
+        for (int f = 0; f < 17 && n > 0 && n < static_cast<int>(sizeof(line)) - 40; ++f) {
+            const uintptr_t feat = sehRead64(pl + 0x270 + 8 * f);
+            if (!feat) continue;
+            n += snprintf(line + n, sizeof(line) - n, " %s=%u", kFeatureNames[f], sehRead8(feat + 0x20));
+        }
+        Log::get().note("%s", line);
+    }
+}
+
 bool LooksLikePointer(uint64_t v) { return v >= 0x10000000000ull && v < 0x800000000000ull; }
 
 void LogDiff(const Snap& from, const Snap& to, bool toFoot) {
@@ -341,6 +385,7 @@ void stereoModeProbeFrame() {
     g_snapPending = false;
     Snap& snap = g_snap[foot ? 1 : 0];
     TakeSnap(snap, tgt);
+    LogPipelines(tgt, foot);
     const Snap& other = g_snap[foot ? 0 : 1];
     if (other.valid) LogDiff(other, snap, foot);
     else
