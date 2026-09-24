@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <intrin.h>
+#include <tlhelp32.h>
 
 #include <atomic>
 #include <cstdint>
@@ -321,6 +322,255 @@ void LogPipelines(uintptr_t tgt, bool foot) {
     }
 }
 
+
+// --- the write-watch: who flips the features at a ship/foot change ----------
+//
+// The pipeline log showed the switch: on foot the Secondary pipeline's scene
+// features are all disabled and both pipelines' Cinema is enabled; in the
+// ship the reverse. Hardware data breakpoints (DR1-DR3: write, one byte) on
+// three of those enabled bytes catch the code that writes them, with the
+// game's own frames unwound -- the decision is in that stack.
+constexpr int kWatchSlots = 3;  // DR1..DR3 (DR0 is pose_reader_watch's)
+const char* const kWatchNames[kWatchSlots] = {"Secondary Cinema", "Secondary scene feature 0", "Primary Cinema"};
+uintptr_t g_watchAddr[kWatchSlots] = {};
+bool g_watchArmed = false, g_watchDone = false;
+ULONGLONG g_watchArmedMs = 0, g_watchSweepMs = 0;
+PVOID g_watchVeh = nullptr;
+uint64_t g_gameSize = 0;
+DWORD g_armedTids[512];
+int g_armedTidCount = 0;
+
+constexpr int kMaxFrames = 14, kMaxHits = 48;
+struct Hit {
+    int slot;
+    uint8_t value;
+    DWORD tid;
+    uint32_t rip;
+    uint32_t frames[kMaxFrames];
+    uint32_t n;
+};
+Hit g_hits[kMaxHits];
+volatile LONG g_hitCount = 0, g_hitsLogged = 0, g_hitsDropped = 0, g_hitsSame = 0;
+// The value each watched byte had at its last write: a write of the same
+// value (a per-frame re-apply) is counted, not recorded.
+volatile uint8_t g_lastValue[kWatchSlots] = {0xFF, 0xFF, 0xFF};
+
+__declspec(noinline) uint32_t unwindGame(const CONTEXT& start, uint32_t* out, uint32_t cap) noexcept {
+    CONTEXT c = start;
+    uint32_t found = 0;
+    for (uint32_t step = 0; step < 40 && found < cap; ++step) {
+        if (!c.Rip) break;
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION function = nullptr;
+        __try {
+            function = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
+        const DWORD64 oldRip = c.Rip, oldRsp = c.Rsp;
+        if (function) {
+            DWORD64 establisher = 0;
+            PVOID handlerData = nullptr;
+            __try {
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, function, &c, &handlerData, &establisher,
+                                 nullptr);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                break;
+            }
+        } else {
+            uintptr_t next = 0;
+            __try {
+                next = *reinterpret_cast<const uintptr_t*>(c.Rsp);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                break;
+            }
+            c.Rip = next;
+            c.Rsp += sizeof(uintptr_t);
+        }
+        if (c.Rsp <= oldRsp || c.Rip == oldRip) break;
+        if (c.Rip >= g_base && c.Rip < g_base + g_gameSize) out[found++] = static_cast<uint32_t>(c.Rip - g_base);
+    }
+    return found;
+}
+
+LONG CALLBACK WatchVeh(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    const DWORD64 dr6 = ep->ContextRecord->Dr6;
+    if (!(dr6 & 0xE)) return EXCEPTION_CONTINUE_SEARCH;  // B1..B3: ours
+    ep->ContextRecord->Dr6 = dr6 & ~DWORD64(0xE);
+    for (int i = 0; i < kWatchSlots; ++i) {
+        if (!(dr6 & (DWORD64(2) << i))) continue;
+        const uint8_t value = *reinterpret_cast<volatile const uint8_t*>(g_watchAddr[i]);
+        if (value == g_lastValue[i]) {
+            InterlockedIncrement(&g_hitsSame);
+            continue;
+        }
+        g_lastValue[i] = value;
+        const LONG idx = InterlockedIncrement(&g_hitCount) - 1;
+        if (idx >= kMaxHits) {
+            InterlockedIncrement(&g_hitsDropped);
+            continue;
+        }
+        Hit& h = g_hits[idx];
+        h.slot = i;
+        h.value = *reinterpret_cast<volatile const uint8_t*>(g_watchAddr[i]);
+        h.tid = GetCurrentThreadId();
+        const uintptr_t rip = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+        h.rip = (rip >= g_base && rip < g_base + g_gameSize) ? static_cast<uint32_t>(rip - g_base) : 0xFFFFFFFFu;
+        h.n = unwindGame(*ep->ContextRecord, h.frames, kMaxFrames);
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Dr7 for slots 1..3: local enable (bit 2i), RW = 01 (write) at 16+4i,
+// LEN = 00 (one byte) at 18+4i. Other bits pass through.
+DWORD64 ComposeDr7(DWORD64 dr7, bool arm) {
+    for (int i = 1; i <= kWatchSlots; ++i) {
+        dr7 &= ~(DWORD64(1) << (2 * i));
+        dr7 &= ~(DWORD64(0xF) << (16 + 4 * i));
+        if (arm && g_watchAddr[i - 1]) dr7 |= (DWORD64(1) << (2 * i)) | (DWORD64(1) << (16 + 4 * i));
+    }
+    return dr7;
+}
+
+bool SetThreadWatch(DWORD tid, bool arm) {
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+    if (!h) return false;
+    bool ok = false;
+    if (SuspendThread(h) != static_cast<DWORD>(-1)) {
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(h, &ctx)) {
+            ctx.Dr7 = ComposeDr7(ctx.Dr7, arm);
+            if (arm) {
+                ctx.Dr1 = g_watchAddr[0];
+                ctx.Dr2 = g_watchAddr[1];
+                ctx.Dr3 = g_watchAddr[2];
+            }
+            ok = SetThreadContext(h, &ctx) != FALSE;
+        }
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+struct SelfArgs {
+    DWORD tid;
+    bool arm;
+};
+DWORD WINAPI SelfWatchProc(LPVOID p) {
+    SelfArgs* a = static_cast<SelfArgs*>(p);
+    SetThreadWatch(a->tid, a->arm);
+    delete a;
+    return 0;
+}
+
+bool SetWatchOn(DWORD tid, bool arm) {
+    if (tid != GetCurrentThreadId()) return SetThreadWatch(tid, arm);
+    auto* a = new (std::nothrow) SelfArgs{tid, arm};
+    if (!a) return false;
+    HANDLE h = CreateThread(nullptr, 0, &SelfWatchProc, a, 0, nullptr);
+    if (!h) {
+        delete a;
+        return false;
+    }
+    WaitForSingleObject(h, 2000);
+    CloseHandle(h);
+    return true;
+}
+
+void SweepWatch() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    const DWORD pid = GetCurrentProcessId();
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid) continue;
+            bool have = false;
+            for (int i = 0; i < g_armedTidCount; ++i)
+                if (g_armedTids[i] == te.th32ThreadID) have = true;
+            if (have || g_armedTidCount >= 512) continue;
+            if (SetWatchOn(te.th32ThreadID, true)) g_armedTids[g_armedTidCount++] = te.th32ThreadID;
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+}
+
+void DisarmWatch() {
+    for (int i = 0; i < g_armedTidCount; ++i) SetWatchOn(g_armedTids[i], false);
+    g_armedTidCount = 0;
+    g_watchArmed = false;
+    g_watchDone = true;
+}
+
+void ArmWatch(uintptr_t tgt) {
+    const uintptr_t p = sehRead64(sehRead64(tgt + 0x248) + 0x1180);
+    const uintptr_t r = sehRead64(p ? p + 0x2CB8 : 0);
+    const uintptr_t primary = sehRead64(r ? r + 0x90 : 0), secondary = sehRead64(r ? r + 0x98 : 0);
+    const uintptr_t secCinema = sehRead64(secondary ? secondary + 0x2E8 : 0);
+    const uintptr_t secScene0 = sehRead64(secondary ? secondary + 0x270 : 0);
+    const uintptr_t priCinema = sehRead64(primary ? primary + 0x2E8 : 0);
+    if (!secCinema || !secScene0 || !priCinema) return;
+    g_watchAddr[0] = secCinema + 0x20;
+    g_watchAddr[1] = secScene0 + 0x20;
+    g_watchAddr[2] = priCinema + 0x20;
+    for (int i = 0; i < kWatchSlots; ++i) g_lastValue[i] = *reinterpret_cast<volatile const uint8_t*>(g_watchAddr[i]);
+    {
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_base);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(g_base + dos->e_lfanew);
+        g_gameSize = nt->OptionalHeader.SizeOfImage;
+    }
+    g_watchVeh = AddVectoredExceptionHandler(1, &WatchVeh);
+    if (!g_watchVeh) {
+        g_watchDone = true;
+        return;
+    }
+    SweepWatch();
+    g_watchArmed = true;
+    g_watchArmedMs = g_watchSweepMs = GetTickCount64();
+    Log::get().note("stereo mode probe: write-watch armed on %d threads: Secondary Cinema %p, Secondary scene "
+                    "feature 0 %p, Primary Cinema %p (enabled bytes).",
+                    g_armedTidCount, reinterpret_cast<void*>(g_watchAddr[0]), reinterpret_cast<void*>(g_watchAddr[1]),
+                    reinterpret_cast<void*>(g_watchAddr[2]));
+}
+
+void WatchFrame(uintptr_t tgt) {
+    if (g_watchDone) return;
+    if (!g_watchArmed) {
+        ArmWatch(tgt);
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    const LONG count = g_hitCount < kMaxHits ? g_hitCount : kMaxHits;
+    while (g_hitsLogged < count) {
+        const Hit& h = g_hits[g_hitsLogged];
+        char frames[400];
+        int n = 0;
+        frames[0] = 0;
+        for (uint32_t i = 0; i < h.n && n < static_cast<int>(sizeof(frames)) - 16; ++i)
+            n += snprintf(frames + n, sizeof(frames) - n, " +0x%X", h.frames[i]);
+        Log::get().note("stereo mode probe: WRITE %s -> %u at +0x%X (thread %lu, journal %s); stack:%s",
+                        kWatchNames[h.slot], h.value, h.rip, h.tid,
+                        !journalOnFootKnown() ? "unknown" : (journalOnFoot() ? "on foot" : "not on foot"), frames);
+        ++g_hitsLogged;
+    }
+    if (now - g_watchSweepMs > 2000) {
+        g_watchSweepMs = now;
+        SweepWatch();
+    }
+    if (now - g_watchArmedMs > 900000 || g_hitCount >= kMaxHits) {
+        DisarmWatch();
+        Log::get().note("stereo mode probe: write-watch disarmed (%ld changes seen, %ld not recorded, %ld "
+                        "same-value writes).",
+                        static_cast<long>(g_hitCount), static_cast<long>(g_hitsDropped),
+                        static_cast<long>(g_hitsSame));
+    }
+}
+
 bool LooksLikePointer(uint64_t v) { return v >= 0x10000000000ull && v < 0x800000000000ull; }
 
 void LogDiff(const Snap& from, const Snap& to, bool toFoot) {
@@ -372,7 +622,9 @@ void LogDiff(const Snap& from, const Snap& to, bool toFoot) {
 
 void stereoModeProbeFrame() {
     const uintptr_t tgt = g_tgt.load(std::memory_order_acquire);
-    if (!tgt || !g_gate.load(std::memory_order_relaxed) || !journalOnFootKnown()) return;
+    if (!tgt || !g_gate.load(std::memory_order_relaxed)) return;
+    WatchFrame(tgt);
+    if (!journalOnFootKnown()) return;
     const bool foot = journalOnFoot();
     const ULONGLONG now = GetTickCount64();
     if (!g_footSeen || foot != g_lastFoot) {
