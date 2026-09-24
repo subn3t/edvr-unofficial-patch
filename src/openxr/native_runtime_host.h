@@ -249,6 +249,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   XrView frameViews[2]{};
   XrView frameContentViews[2]{};
   StereoPlacement framePlacement[2]{};
+  bool onFootFlatNoted[2]{};  // the on-foot stereo's placement, traced once per stretch
   uint64_t copiedEyes=0, composedPairs=0;
   SystemPublication geometry; uint64_t geometryGeneration=0;
   OpenVRSystem systemInterface{*this};
@@ -1221,7 +1222,48 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       const auto place=cullGuard.placementBounds(unsigned(eye));
       framePlacement[unsigned(eye)]={place.left,place.top,place.right,place.bottom};
     }
-    if(!temporalOutput) {
+    // THE ON-FOOT STEREO (frame_flag.h, onFootFlat). Each eye's image is
+    // the game's flat frustum -- centred, tangents +-flatX by +-flatY --
+    // rendered from that eye's position with the head's rotation at this
+    // frame's pose. It is placed at those angles inside the eye's located
+    // field, black around it, and cropped where it runs past the field's
+    // edge (the flat width passes the nose side). The layer keeps the
+    // located pose and field, so the compositor's own reprojection carries
+    // it from the rendered head to the displayed one. Supersedes the cull
+    // guard's placement: on foot the game renders none of what it was told.
+    bool flat=false;
+    StereoPlacement flatCrop{};
+    {
+      float flatX=0,flatY=0;
+      RawFov eyeRaw{};
+      if(edvr::onFootFlat(&flatX,&flatY)&&fovToRaw(frameViews[unsigned(eye)].fov,eyeRaw)) {
+        const float up=eyeRaw.bottom,down=eyeRaw.top;  // Valve's reversed vertical names
+        const float w=eyeRaw.right-eyeRaw.left,h=up-down;
+        const float pl=(-flatX-eyeRaw.left)/w,pr=(flatX-eyeRaw.left)/w;
+        const float pt=(up-flatY)/h,pb=(up+flatY)/h;
+        const float vl=(std::max)(pl,0.f),vr=(std::min)(pr,1.f),vt=(std::max)(pt,0.f),vb=(std::min)(pb,1.f);
+        if(w>1e-4f&&h>1e-4f&&vr-vl>1e-3f&&vb-vt>1e-3f) {
+          flat=true;
+          framePlacement[unsigned(eye)]={vl,vt,vr,vb};
+          flatCrop={(vl-pl)/(pr-pl),(vt-pt)/(pb-pt),(vr-pl)/(pr-pl),(vb-pt)/(pb-pt)};
+          frameContentViews[unsigned(eye)].fov={std::atan(eyeRaw.left+vl*w),std::atan(eyeRaw.left+vr*w),
+            std::atan(up-vt*h),std::atan(up-vb*h)};
+          if(!onFootFlatNoted[unsigned(eye)]) {
+            onFootFlatNoted[unsigned(eye)]=true;
+            nativeTracePrintf("onfoot_flat,eye=%u,flat=%.4f/%.4f,eye_field=%.4f/%.4f/%.4f/%.4f,placement=%.4f/%.4f/%.4f/%.4f,crop=%.4f/%.4f/%.4f/%.4f\n",
+              unsigned(eye),flatX,flatY,eyeRaw.left,eyeRaw.right,down,up,vl,vt,vr,vb,
+              flatCrop.left,flatCrop.top,flatCrop.right,flatCrop.bottom);
+          }
+        }
+      }
+      if(!flat)onFootFlatNoted[unsigned(eye)]=false;
+      if(eye==vr::Eye_Right) {
+        const auto& a=frameViews[0].pose.position;const auto& b=frameViews[1].pose.position;
+        const float dx=a.x-b.x,dy=a.y-b.y,dz=a.z-b.z;
+        edvr::announceEyeSeparation(std::sqrt(dx*dx+dy*dy+dz*dz));
+      }
+    }
+    if(!temporalOutput&&!flat) {
       const auto* shift=frameTangentShift[unsigned(eye)];
       if(shift[0]!=0||shift[1]!=0) {
         auto& fov=frameContentViews[unsigned(eye)].fov;
@@ -1248,7 +1290,10 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     auto* sharpenSource=healed?healed.Get():temporalOutput?temporalOutput.Get():submittedSource;
     const auto* sharpenBounds=healed?&fullBounds:temporalOutput?&temporalBounds:bounds;
     vr::VRTextureBounds_t croppedBounds{};
-    if(cullGuard.stage()==NativeCullStage::Live) {
+    if(flat) {
+      croppedBounds=nativeCropBounds(sharpenBounds,flatCrop.left,flatCrop.top,flatCrop.right,flatCrop.bottom);
+      sharpenBounds=&croppedBounds;
+    } else if(cullGuard.stage()==NativeCullStage::Live) {
       const auto crop=cullGuard.cropBounds(unsigned(eye));
       croppedBounds=nativeCropBounds(sharpenBounds,crop.left,crop.top,crop.right,crop.bottom);
       sharpenBounds=&croppedBounds;

@@ -36,4 +36,9 @@ void stereoModeProbeConfigure(Config& cfg);
 // on-foot state and logs what differs.
 void stereoModeProbeFrame();
 
+// The on-foot stereo (experimental.onfoot_stereo) is installed, switched on,
+// and the journal says on foot: the engine is rendering both eye pipelines
+// with the on-foot camera (onfoot_look.h moves their eyes).
+bool onFootStereoWanted();
+
 }  // namespace edvr

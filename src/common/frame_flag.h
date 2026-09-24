@@ -24,7 +24,7 @@ namespace edvr {
 //
 // Both DLLs compile frame_flag.cpp, and the shared block's layout changes
 // with it, so the block's name carries the version
-// (Local\edvr_glitch_frame_v36_<pid>): halves from different builds never
+// (Local\edvr_glitch_frame_v37_<pid>): halves from different builds never
 // share one. That kept a mismatched pair inert, but silently. Since v34
 // each half also signs a small version-independent roll-call with the
 // version it was built with, and looks for the last unsigned layout's
@@ -32,7 +32,7 @@ namespace edvr {
 // version REFUSES the channel -- from then on every call here reads as "no
 // answer" and writes nothing -- and frameFlagPeerMismatch() names the
 // partner's version so the caller's log can say both.
-constexpr uint32_t kFrameFlagVersion = 36;
+constexpr uint32_t kFrameFlagVersion = 37;
 
 // The partner half's layout version when it differs from kFrameFlagVersion,
 // else 0. Nonzero means the channel is refused. Each half asks on a cadence
@@ -185,6 +185,27 @@ void setExternalCameraOnFoot(bool on);
 // the other eye's camera, so the runtime submits each to the other eye.
 void setEyeSwap(bool on);
 bool eyeSwap();
+
+// On-foot stereo (experimental.onfoot_stereo with the head look): d3d11
+// says, every frame, whether each eye's image is the game's flat frustum --
+// half-width tanX, half-height tanY, centred -- rendered from that eye's
+// position with the head's rotation. The runtime then places it at those
+// angles inside the eye's field instead of stretching it over the whole.
+// False when off or when the tangents are not sane.
+void setOnFootFlat(bool on, float tanX, float tanY);
+bool onFootFlat(float* tanX, float* tanY);
+
+// The texture the game passed to Submit for each eye (0 left, 1 right), a raw
+// ID3D11Texture2D pointer valid within this process, before any EDVR swap:
+// d3d11 matches it against the eye pipelines' targets to learn which one
+// renders the left eye. Separate from submitTex, which the FSS series owns.
+void publishGameSubmit(int eye, void* texture);
+void* gameSubmitted(int eye);
+
+// Metres between the runtime's two located eye views (the headset's IPD);
+// 0 until the runtime has located a frame, or when out of 3..10 cm.
+void announceEyeSeparation(float metres);
+float eyeSeparation();
 
 // The last value written, whenever it was written.
 //
