@@ -58,6 +58,7 @@ uint32_t g_panelW = 0, g_panelH = 0;  // refreshed each frame
 
 // The render-target check, cached by the binding shadow's generations.
 uint32_t g_rtvGen = 0, g_dsvGen = 0;
+bool g_stereoDiag = false;  // experimental.onfoot_stereo_diag: eye-sized G-buffers count too
 bool g_rtvIsPanelGBuffer = false;
 // The last R10G10B10A2 target with a depth bound, whatever its size: what the
 // "on foot but no panel scene" line reports, so a size mismatch is visible.
@@ -453,7 +454,7 @@ bool PanelGBufferBound() {
         tex->GetDesc(&td);
         g_lastGbufW = td.Width;
         g_lastGbufH = td.Height;
-        g_rtvIsPanelGBuffer = td.Width == g_panelW && td.Height == g_panelH;
+        g_rtvIsPanelGBuffer = (td.Width == g_panelW && td.Height == g_panelH) || (g_stereoDiag && td.Width >= 1024);
         tex->Release();
     }
     res->Release();
@@ -709,6 +710,118 @@ void LockRestore(ID3D11DeviceContext* ctx) {
     s = LockSaved{};
 }
 
+
+// --- the stereo diagnostic (experimental.onfoot_stereo_diag) ------------------
+//
+// With the engine kept in HMD stereo on foot (stereo_mode_probe.h), both eye
+// pipelines render the scene, but the first flight saw the views glued to the
+// face and the eyes unfusable. At each new G-buffer pass (any R10G10B10A2
+// target with depth, eye-sized included) this takes b1's clip transform as last
+// written -- the pass's camera -- and every two seconds logs each pass's eye:
+// position (the point the clip's x, y and w rows share), axes, projection, and
+// the offset between the passes in the first one's axes, with the head's yaw.
+float g_lastB1Clip[16] = {};
+bool g_lastB1Valid = false, g_diagWasBound = false;
+constexpr int kDiagPasses = 6;
+struct DiagPass {
+    void* rtv;
+    uint32_t w, h;
+    float clip[16];
+};
+DiagPass g_diagPass[kDiagPasses];
+int g_diagCount = 0;
+ULONGLONG g_diagLastLog = 0;
+
+bool EyeFromClip(const float* e, double c[3], double f[3], double r[3], double u[3], double* sx, double* sy,
+                 double* ox, double* oy) {
+    double row[4][4];
+    for (int k = 0; k < 4; ++k)
+        for (int i = 0; i < 4; ++i) row[k][i] = e[4 * i + k];
+    const double* a = row[0];
+    const double* b = row[1];
+    const double* w = row[3];
+    const double det = a[0] * (b[1] * w[2] - b[2] * w[1]) - a[1] * (b[0] * w[2] - b[2] * w[0]) +
+                       a[2] * (b[0] * w[1] - b[1] * w[0]);
+    if (std::fabs(det) < 1e-12) return false;
+    const double rhs[3] = {-a[3], -b[3], -w[3]};
+    auto solve = [&](int col) {
+        double m[3][3] = {{a[0], a[1], a[2]}, {b[0], b[1], b[2]}, {w[0], w[1], w[2]}};
+        for (int k = 0; k < 3; ++k) m[k][col] = rhs[k];
+        return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) /
+               det;
+    };
+    for (int i = 0; i < 3; ++i) c[i] = solve(i);
+    const double lw = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+    for (int i = 0; i < 3; ++i) f[i] = w[i] / lw;
+    const double af = (a[0] * f[0] + a[1] * f[1] + a[2] * f[2]), bf = (b[0] * f[0] + b[1] * f[1] + b[2] * f[2]);
+    for (int i = 0; i < 3; ++i) {
+        r[i] = a[i] - af * f[i];
+        u[i] = b[i] - bf * f[i];
+    }
+    *sx = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]) / lw;
+    *sy = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]) / lw;
+    for (int i = 0; i < 3; ++i) {
+        r[i] /= (*sx * lw);
+        u[i] /= (*sy * lw);
+    }
+    *ox = af / lw;  // clip x per unit forward: the off-centre term
+    *oy = bf / lw;
+    return true;
+}
+
+void DiagDraw() {
+    const bool bound = PanelGBufferBound();
+    if (bound && !g_diagWasBound && g_diagCount < kDiagPasses && g_lastB1Valid) {
+        DiagPass& d = g_diagPass[g_diagCount++];
+        d.rtv = bindingGet(BindSlot::Rtv0);
+        d.w = g_lastGbufW;
+        d.h = g_lastGbufH;
+        memcpy(d.clip, g_lastB1Clip, sizeof(d.clip));
+    }
+    g_diagWasBound = bound;
+}
+
+void DiagFrame() {
+    const ULONGLONG now = GetTickCount64();
+    if (g_diagCount && now - g_diagLastLog > 2000) {
+        g_diagLastLog = now;
+        float m[12];
+        double yaw = 0, pitch = 0;
+        if (headPose(m)) {
+            yaw = std::atan2(-m[2], m[10]) * 57.29577951308232;
+            pitch = std::asin(std::fmax(-1.0, std::fmin(1.0, m[6]))) * 57.29577951308232;
+        }
+        double c0[3] = {}, f0[3] = {}, r0[3] = {}, u0[3] = {};
+        for (int k = 0; k < g_diagCount; ++k) {
+            const DiagPass& d = g_diagPass[k];
+            double c[3], f[3], r[3], u[3], sx, sy, ox, oy;
+            if (!EyeFromClip(d.clip, c, f, r, u, &sx, &sy, &ox, &oy)) {
+                Log::get().note("onfoot stereo diag: pass %d (%ux%u) has no eye point.", k, d.w, d.h);
+                continue;
+            }
+            if (k == 0) {
+                memcpy(c0, c, sizeof(c0));
+                memcpy(f0, f, sizeof(f0));
+                memcpy(r0, r, sizeof(r0));
+                memcpy(u0, u, sizeof(u0));
+            }
+            const double dc[3] = {c[0] - c0[0], c[1] - c0[1], c[2] - c0[2]};
+            const double dr = dc[0] * r0[0] + dc[1] * r0[1] + dc[2] * r0[2];
+            const double du = dc[0] * u0[0] + dc[1] * u0[1] + dc[2] * u0[2];
+            const double df = dc[0] * f0[0] + dc[1] * f0[1] + dc[2] * f0[2];
+            const double cosF = std::fmax(-1.0, std::fmin(1.0, f[0] * f0[0] + f[1] * f0[1] + f[2] * f0[2]));
+            Log::get().note("onfoot stereo diag: pass %d rtv %p %ux%u: eye (%.4f %.4f %.4f) forward (%.3f %.3f %.3f) "
+                            "right (%.3f %.3f %.3f); proj sx %.3f sy %.3f off %.3f %.3f; vs pass 0: offset right "
+                            "%.4f up %.4f fwd %.4f, forward differs %.2f deg; head yaw %.1f pitch %.1f.",
+                            k, d.rtv, d.w, d.h, c[0], c[1], c[2], f[0], f[1], f[2], r[0], r[1], r[2], sx, sy, ox, oy,
+                            dr, du, df, std::acos(cosF) * 57.29577951308232, yaw, pitch);
+        }
+    }
+    g_diagCount = 0;
+    g_diagWasBound = false;
+}
+
 // --- capture: the census key (hotkey.dump_draws) on foot ---------------------
 //
 // A developer instrument. One whole on-foot frame of every write this module
@@ -802,6 +915,11 @@ void onFootLookConfigure(Config& cfg) {
                                  "in each eye at the game's own field of view)."
                                : "onfoot look: head-locked view off.");
     detail::g_onFootHeadLocked = locked;
+    const bool diag = cfg.getBool("experimental.onfoot_stereo_diag", false);
+    if (diag != g_stereoDiag)
+        Log::get().note("onfoot look: stereo diagnostic %s.", diag ? "ON (each G-buffer pass's eye logged)" : "off");
+    g_stereoDiag = diag;
+    g_rtvGen = g_dsvGen = 0;
     const float hud = cfg.getFloat("experimental.onfoot_hud_scale", 1.0f);
     const float hudClamped = hud < 0.3f ? 0.3f : (hud > 1.5f ? 1.5f : hud);
     if (hudClamped != g_hudScale) Log::get().note("onfoot look: helmet HUD drawn at %.2f of its size.", hudClamped);
@@ -826,6 +944,7 @@ void onFootLookConfigure(Config& cfg) {
 void onFootLookBeforeDraw() {
     if (!detail::g_onFootLookEnabled) return;
     ++g_drawOrdinal;
+    if (g_stereoDiag) DiagDraw();
     if (g_foundThisFrame) return;
     if (!PanelGBufferBound()) return;
     g_foundThisFrame = true;
@@ -890,6 +1009,8 @@ void onFootLookBeforeUnmap(ID3D11Resource* res) {
         memcpy(g_frameData, work, g_frameFloats * 4);
         memcpy(g_eyeClip, work + kClipOffset / 4, sizeof(g_eyeClip));
         g_eyeClipValid = true;
+        memcpy(g_lastB1Clip, work + kClipOffset / 4, sizeof(g_lastB1Clip));
+        g_lastB1Valid = true;
         g_frameData = nullptr;
     } else {
         for (Pending& p : g_pending) {
@@ -909,6 +1030,7 @@ void onFootLookStateCleared() {
 void onFootLookFrameBoundary() {
     if (!detail::g_onFootLookEnabled) return;
     ++g_frames;
+    if (g_stereoDiag) DiagFrame();
     if (g_foundThisFrame) ++g_panelFrames;
     g_panelLastFrame = g_foundThisFrame;
     g_foundThisFrame = false;
