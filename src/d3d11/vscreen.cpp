@@ -5138,6 +5138,7 @@ void vScreenFrameBoundary() {
         quadProbeTick(g_state->ownerCtx);
         drawCensusTick(g_state->ownerCtx);
         onFootLookFrameBoundary();
+        stereoModeProbeFrame();
         objectProbeFrameBoundary(g_state->ownerCtx);
         panelUpscaleFrameEnd();
         wakePulseReport();

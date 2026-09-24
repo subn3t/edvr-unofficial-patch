@@ -39,6 +39,7 @@ std::atomic<Execute> g_original{nullptr};
 std::atomic<int> g_override{-1};
 std::atomic<int> g_lines{0};
 uintptr_t g_base = 0;
+std::atomic<uintptr_t> g_tgt{0};  // the stereo mode's target, learned at the activity's call
 bool g_installTried = false;
 CodeHook g_hook;
 
@@ -94,6 +95,7 @@ __declspec(noinline) uintptr_t __fastcall observed(uintptr_t self, uintptr_t a2,
         const bool footKnown = journalOnFootKnown();
         uintptr_t tgt = 0, vtable = 0, setter = 0;
         const bool resolved = sehResolveTarget(self, &tgt, &vtable, &setter);
+        if (resolved) g_tgt.store(tgt, std::memory_order_release);
         auto rva = [](uintptr_t a) { return static_cast<unsigned long long>(a >= g_base ? a - g_base : a); };
         Log::get().note("stereo mode probe: SetIdentStereoRenderMode mode %d%s (caller +0x%llX, thread %lu, "
                         "journal: %s); target %p vtable +0x%llX setter +0x%llX%s%s",
@@ -215,6 +217,138 @@ void install() {
     Log::get().note("stereo mode probe: installed on SetIdentStereoRenderModeActivity's Execute (+0x%llX).",
                     static_cast<unsigned long long>(kExecuteRva));
 }
+
+// --- the ship/foot differ -----------------------------------------------------
+//
+// The setter (+0x2875110) writes the mode at +0x118 of two views reached from
+// the target: P = tgt->[0x248]->[0x1180], R = P->[0x2CB8], view = get(R->[0x90])
+// and get(R->[0x98]), get(x) = x->[0x2D0]->[0x30]. A few seconds after each
+// change of the journal's on-foot state, those objects are snapshotted; the
+// small integers, flags and pointers that differ from the other state's
+// snapshot are logged. Whatever flips when you step out of the ship is the
+// switch, or the way to it.
+struct Region {
+    const char* name;
+    uint32_t bytes;
+};
+constexpr Region kRegions[] = {{"tgt", 0x400}, {"P", 0x4000}, {"R", 0x800}, {"viewA", 0x400}, {"viewB", 0x400}};
+constexpr int kRegionCount = sizeof(kRegions) / sizeof(kRegions[0]);
+struct Snap {
+    bool valid = false;
+    uintptr_t addr[kRegionCount] = {};
+    bool read[kRegionCount] = {};
+    uint8_t bytes[kRegionCount][0x4000];
+};
+Snap g_snap[2];  // [0] not on foot, [1] on foot
+bool g_footSeen = false, g_lastFoot = false, g_snapPending = false;
+ULONGLONG g_changeMs = 0;
+
+__declspec(noinline) uintptr_t sehRead64(uintptr_t a) noexcept {
+    __try {
+        return a ? *reinterpret_cast<const uintptr_t*>(a) : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+__declspec(noinline) bool sehCopy(void* dst, uintptr_t src, uint32_t n) noexcept {
+    __try {
+        std::memcpy(dst, reinterpret_cast<const void*>(src), n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+uintptr_t ViewOf(uintptr_t x) {
+    const uintptr_t h = sehRead64(x ? x + 0x2D0 : 0);
+    return sehRead64(h ? h + 0x30 : 0);
+}
+
+void TakeSnap(Snap& snap, uintptr_t tgt) {
+    const uintptr_t p = sehRead64(sehRead64(tgt + 0x248) + 0x1180);
+    const uintptr_t r = sehRead64(p ? p + 0x2CB8 : 0);
+    const uintptr_t a[kRegionCount] = {tgt, p, r, ViewOf(sehRead64(r ? r + 0x90 : 0)),
+                                       ViewOf(sehRead64(r ? r + 0x98 : 0))};
+    for (int i = 0; i < kRegionCount; ++i) {
+        snap.addr[i] = a[i];
+        snap.read[i] = a[i] && sehCopy(snap.bytes[i], a[i], kRegions[i].bytes);
+    }
+    snap.valid = true;
+}
+
+bool LooksLikePointer(uint64_t v) { return v >= 0x10000000000ull && v < 0x800000000000ull; }
+
+void LogDiff(const Snap& from, const Snap& to, bool toFoot) {
+    const char* dir = toFoot ? "ship -> foot" : "foot -> ship";
+    int lines = 0;
+    for (int i = 0; i < kRegionCount; ++i) {
+        const Region& reg = kRegions[i];
+        if (from.addr[i] != to.addr[i])
+            Log::get().note("stereo mode probe: diff %s: %s moved %p -> %p.", dir, reg.name,
+                            reinterpret_cast<void*>(from.addr[i]), reinterpret_cast<void*>(to.addr[i]));
+        if (!from.read[i] || !to.read[i]) {
+            Log::get().note("stereo mode probe: diff %s: %s unreadable (%d/%d).", dir, reg.name, from.read[i],
+                            to.read[i]);
+            continue;
+        }
+        for (uint32_t k = 0; k + 8 <= reg.bytes && lines < 240; k += 4) {
+            uint32_t a, b;
+            std::memcpy(&a, from.bytes[i] + k, 4);
+            std::memcpy(&b, to.bytes[i] + k, 4);
+            if (a == b) continue;
+            if (k % 8 == 0) {
+                uint64_t qa, qb;
+                std::memcpy(&qa, from.bytes[i] + k, 8);
+                std::memcpy(&qb, to.bytes[i] + k, 8);
+                if (LooksLikePointer(qa) || LooksLikePointer(qb)) {
+                    Log::get().note("stereo mode probe: diff %s: %s+0x%X pointer %p -> %p", dir, reg.name, k,
+                                    reinterpret_cast<void*>(qa), reinterpret_cast<void*>(qb));
+                    ++lines;
+                    k += 4;
+                    continue;
+                }
+            }
+            if (a < 0x10000 && b < 0x10000) {
+                Log::get().note("stereo mode probe: diff %s: %s+0x%X %u -> %u (bytes %08X -> %08X)", dir, reg.name,
+                                k, a, b, a, b);
+                ++lines;
+            }
+        }
+    }
+    uint32_t va[3] = {}, vb[3] = {};
+    if (to.read[3]) std::memcpy(va, to.bytes[3] + 0x110, 12);
+    if (to.read[4]) std::memcpy(vb, to.bytes[4] + 0x110, 12);
+    Log::get().note("stereo mode probe: now %s: viewA +0x110 %u, +0x118 (mode) %u, +0x11C %08X; viewB %u, %u, "
+                    "%08X (%d lines of difference).",
+                    toFoot ? "on foot" : "not on foot", va[0], va[1], va[2], vb[0], vb[1], vb[2], lines);
+}
+
+}  // namespace
+
+void stereoModeProbeFrame() {
+    const uintptr_t tgt = g_tgt.load(std::memory_order_acquire);
+    if (!tgt || !g_gate.load(std::memory_order_relaxed) || !journalOnFootKnown()) return;
+    const bool foot = journalOnFoot();
+    const ULONGLONG now = GetTickCount64();
+    if (!g_footSeen || foot != g_lastFoot) {
+        g_footSeen = true;
+        g_lastFoot = foot;
+        g_changeMs = now;
+        g_snapPending = true;
+    }
+    if (!g_snapPending || now - g_changeMs < 5000) return;
+    g_snapPending = false;
+    Snap& snap = g_snap[foot ? 1 : 0];
+    TakeSnap(snap, tgt);
+    const Snap& other = g_snap[foot ? 0 : 1];
+    if (other.valid) LogDiff(other, snap, foot);
+    else
+        Log::get().note("stereo mode probe: first snapshot taken (%s); the diff comes at the next change.",
+                        foot ? "on foot" : "not on foot");
+}
+
+namespace {
 
 }  // namespace
 
