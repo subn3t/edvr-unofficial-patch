@@ -36,9 +36,15 @@ void stereoModeProbeConfigure(Config& cfg);
 // on-foot state and logs what differs.
 void stereoModeProbeFrame();
 
-// The on-foot stereo (experimental.onfoot_stereo) is installed, switched on,
-// and the journal says on foot: the engine is rendering both eye pipelines
-// with the on-foot camera (onfoot_look.h moves their eyes).
+// The on-foot stereo (experimental.onfoot_stereo) is installed and switched
+// on: the engine stays in HMD stereo wherever the player is, and after a
+// visit on foot the cockpit renders into panel-sized targets too.
+bool onFootStereoHolding();
+
+// ... and the game is asking for its on-foot mode (the patch substituted it
+// within the last frames): the engine is rendering both eye pipelines with
+// the on-foot camera (onfoot_look.h moves their eyes). The engine's own
+// word, so right from a load on foot, unlike the journal.
 bool onFootStereoWanted();
 
 }  // namespace edvr

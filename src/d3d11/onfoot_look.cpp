@@ -246,11 +246,12 @@ void TakeHeadRotation() {
 // display mode never changes back), so the panel test alone passes in the
 // cockpit: its asymmetric eye views were refused as off-centre, but the
 // shadow mask turned, and the cockpit's shadows swung with the head (flight
-// of 2026-09-24). The journal says where the player is; the centred test
-// holds until it does.
+// of 2026-09-24). With the stereo holding, the engine says where the player
+// is (stereo_mode_probe.h); not the journal, which after a load on foot
+// still holds the last session's Embark.
 bool Armed() {
     if (!g_panelLastFrame || !g_haveMain || !g_mainCentred) return false;
-    if (journalOnFootKnown() && !journalOnFoot()) return false;
+    if (onFootStereoHolding() && !onFootStereoWanted()) return false;
     TakeHeadRotation();
     if (!g_qValid) {
         ++g_noPose;
@@ -324,7 +325,7 @@ bool TurnSameCamera(float* rows) {
 // of the headset's field.
 bool ScaleHud(float* rows) {
     if (g_hudScale == 1.0f || !g_haveMain || !g_panelLastFrame || !g_mainCentred) return false;
-    if (journalOnFootKnown() && !journalOnFoot()) return false;
+    if (onFootStereoHolding() && !onFootStereoWanted()) return false;
     const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
     if (sy < 1e-6 || !Near(sw, 1, 1e-3) || sx < 1.1 * g_mainScale[0]) return false;
     const double aspect = g_mainScale[0] / g_mainScale[1];
