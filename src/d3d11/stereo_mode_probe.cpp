@@ -333,7 +333,7 @@ void LogPipelines(uintptr_t tgt, bool foot) {
 constexpr int kWatchSlots = 3;  // DR1..DR3 (DR0 is pose_reader_watch's)
 const char* const kWatchNames[kWatchSlots] = {"Secondary Cinema", "Secondary scene feature 0", "Primary Cinema"};
 uintptr_t g_watchAddr[kWatchSlots] = {};
-bool g_watchArmed = false, g_watchDone = false;
+bool g_watchArmed = false, g_watchDone = false, g_watchWanted = false;
 ULONGLONG g_watchArmedMs = 0, g_watchSweepMs = 0;
 PVOID g_watchVeh = nullptr;
 uint64_t g_gameSize = 0;
@@ -571,6 +571,8 @@ void WatchFrame(uintptr_t tgt) {
     }
 }
 
+void StereoFrame();  // the on-foot stereo patch, below
+
 bool LooksLikePointer(uint64_t v) { return v >= 0x10000000000ull && v < 0x800000000000ull; }
 
 void LogDiff(const Snap& from, const Snap& to, bool toFoot) {
@@ -621,9 +623,10 @@ void LogDiff(const Snap& from, const Snap& to, bool toFoot) {
 }  // namespace
 
 void stereoModeProbeFrame() {
+    StereoFrame();
     const uintptr_t tgt = g_tgt.load(std::memory_order_acquire);
     if (!tgt || !g_gate.load(std::memory_order_relaxed)) return;
-    WatchFrame(tgt);
+    if (g_watchWanted || g_watchArmed) WatchFrame(tgt);
     if (!journalOnFootKnown()) return;
     const bool foot = journalOnFoot();
     const ULONGLONG now = GetTickCount64();
@@ -647,9 +650,123 @@ void stereoModeProbeFrame() {
 
 namespace {
 
+// --- on-foot stereo: keep the display mode at HMD stereo ----------------------
+//
+// The write-watch (flight 005341) caught the switch: at a ship/foot change the
+// display-mode updater (+0x2890B30) finds P->[0x3698] (the wanted mode) unlike
+// P->[0x3694] (the current one), applies it, and the feature set follows --
+// Secondary's scene features off and Cinema on both eyes for mode 5 (on foot),
+// the reverse for mode 3 (the ship, HMD stereo, the Settings.xml
+// StereoscopicMode). The wanted mode is copied every frame at +0x281B052:
+//
+//     +0x281B04F  8B 40 20            mov eax,[rax+20h]
+//     +0x281B052  89 81 98 36 00 00   mov [rcx+3698h],eax
+//
+// experimental.onfoot_stereo replaces that store with a jump to a stub that
+// stores 3 where the game would store 5, so the updater never starts the
+// switch and the engine keeps rendering both eyes. A flag in our own memory
+// turns it on and off live; the patch itself stays for the session.
+constexpr uintptr_t kStoreRva = 0x281B052u;
+constexpr uint8_t kStoreBytes[9] = {0x8B, 0x40, 0x20, 0x89, 0x81, 0x98, 0x36, 0x00, 0x00};  // from +0x281B04F
+uint8_t* g_stereoStub = nullptr;
+volatile uint8_t* g_stereoData = nullptr;  // +0 flag, +4 substitutions
+bool g_stereoTried = false, g_stereoPatched = false;
+uint32_t g_stereoLastCount = 0;
+
+void InstallStereoPatch() {
+    g_stereoTried = true;
+    if (!g_base) g_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if (const char* why = checkTarget(g_base)) {
+        Log::get().note("onfoot stereo: not installed: %s.", why);
+        return;
+    }
+    const uintptr_t site = g_base + kStoreRva;
+    if (std::memcmp(reinterpret_cast<const void*>(site - 3), kStoreBytes, sizeof(kStoreBytes)) != 0) {
+        Log::get().note("onfoot stereo: not installed: the display-mode store's bytes are not the expected ones.");
+        return;
+    }
+    uint8_t* stub = allocateRelay(site);
+    uint8_t* data = stub ? allocateRelay(site) : nullptr;
+    if (!stub || !data) {
+        Log::get().note("onfoot stereo: not installed: no memory near the game's code.");
+        return;
+    }
+    const uintptr_t st = reinterpret_cast<uintptr_t>(stub), dt = reinterpret_cast<uintptr_t>(data);
+    uint8_t code[0x24] = {
+        0x80, 0x3D, 0, 0, 0, 0, 0x00,  // 00 cmp byte ptr [rip+flag],0
+        0x74, 0x10,                    // 07 je 19
+        0x83, 0xF8, 0x05,              // 09 cmp eax,5
+        0x75, 0x0B,                    // 0C jne 19
+        0xB8, 0x03, 0x00, 0x00, 0x00,  // 0E mov eax,3
+        0xFF, 0x05, 0, 0, 0, 0,        // 13 inc dword ptr [rip+count]
+        0x89, 0x81, 0x98, 0x36, 0x00, 0x00,  // 19 mov [rcx+3698h],eax
+        0xE9, 0, 0, 0, 0};             // 1F jmp back
+    const int32_t flagDisp = static_cast<int32_t>(static_cast<intptr_t>(dt) - static_cast<intptr_t>(st + 0x07));
+    const int32_t countDisp = static_cast<int32_t>(static_cast<intptr_t>(dt + 4) - static_cast<intptr_t>(st + 0x19));
+    const int32_t backDisp = static_cast<int32_t>(static_cast<intptr_t>(site + 6) - static_cast<intptr_t>(st + 0x24));
+    std::memcpy(code + 0x02, &flagDisp, 4);
+    std::memcpy(code + 0x15, &countDisp, 4);
+    std::memcpy(code + 0x20, &backDisp, 4);
+    std::memcpy(stub, code, sizeof(code));
+    DWORD old = 0;
+    if (!VirtualProtect(stub, 4096, PAGE_EXECUTE_READ, &old) ||
+        !FlushInstructionCache(GetCurrentProcess(), stub, sizeof(code))) {
+        Log::get().note("onfoot stereo: not installed: the stub could not be made executable.");
+        return;
+    }
+    g_stereoStub = stub;
+    g_stereoData = data;
+    // The site as one aligned 8-byte store: +0x281B050 keeps its two bytes
+    // (the tail of the mov eax before it), then E9 rel32 to the stub and a
+    // NOP over the store's last byte. A thread can only be at an instruction
+    // boundary, and +0x281B04F's bytes are unchanged, so none sees half.
+    const uintptr_t q = site - 2;
+    if (q % 8 != 0) {
+        Log::get().note("onfoot stereo: not installed: the site is not where an atomic store can cover it.");
+        return;
+    }
+    uint8_t bytes[8];
+    std::memcpy(bytes, reinterpret_cast<const void*>(q), 8);
+    const int32_t toStub = static_cast<int32_t>(static_cast<intptr_t>(st) - static_cast<intptr_t>(site + 5));
+    bytes[2] = 0xE9;
+    std::memcpy(bytes + 3, &toStub, 4);
+    bytes[7] = 0x90;
+    int64_t value;
+    std::memcpy(&value, bytes, 8);
+    if (!VirtualProtect(reinterpret_cast<void*>(q), 8, PAGE_EXECUTE_READWRITE, &old)) {
+        Log::get().note("onfoot stereo: not installed: the game's code page could not be made writable.");
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(q), value);
+    DWORD ignored = 0;
+    VirtualProtect(reinterpret_cast<void*>(q), 8, old, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(q), 8);
+    g_stereoPatched = true;
+    Log::get().note("onfoot stereo: installed at the display-mode store (+0x%llX): on foot the engine is kept in "
+                    "HMD stereo (mode 3) instead of HMD Cinema (5).",
+                    static_cast<unsigned long long>(kStoreRva));
+}
+
+void StereoFrame() {
+    if (!g_stereoPatched) return;
+    const uint32_t count = *reinterpret_cast<volatile const uint32_t*>(g_stereoData + 4);
+    if (count && !g_stereoLastCount)
+        Log::get().note("onfoot stereo: the game asked for HMD Cinema (5); kept at HMD stereo (3).");
+    g_stereoLastCount = count;
+}
+
 }  // namespace
 
 void stereoModeProbeConfigure(Config& cfg) {
+    const bool stereo = cfg.getBool("experimental.onfoot_stereo", false);
+    if (stereo && !g_stereoTried) InstallStereoPatch();
+    if (g_stereoData) {
+        const uint8_t want = stereo ? 1 : 0;
+        if (*g_stereoData != want)
+            Log::get().note(stereo ? "onfoot stereo: ON (live)." : "onfoot stereo: off (live; the game's own mode).");
+        *g_stereoData = want;
+    }
+    g_watchWanted = cfg.getBool("experimental.stereo_mode_watch", false);
     const bool on = cfg.getBool("experimental.stereo_mode_probe", false);
     const int override = cfg.getInt("experimental.stereo_mode_override", -1);
     if (on && !g_installTried) install();
