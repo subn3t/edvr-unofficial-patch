@@ -33,6 +33,7 @@
 #include "weapon_motion.h"
 #include "night_vision.h"
 #include "onfoot_look.h"
+#include "stereo_mode_probe.h"
 #include "device_hook.h"  // contextHookModeFor
 #include "draw_census.h"
 #include "draw_gate.h"    // the sampled subscriber gate the draw path reads
@@ -5111,6 +5112,7 @@ void vScreenRefreshConfig() {
     sunglareConfigure(cfg);
     exposureConfigure(cfg);
     onFootLookConfigure(cfg);
+    stereoModeProbeConfigure(cfg);
     panelCurveConfigure(cfg);
     particleConfigure(cfg);
     objectProbeConfigure(cfg);
@@ -6291,6 +6293,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     sunglareConfigure(cfg);
     exposureConfigure(cfg);
     onFootLookConfigure(cfg);
+    stereoModeProbeConfigure(cfg);
     panelCurveConfigure(cfg);
     particleConfigure(cfg);
     objectProbeConfigure(cfg);
