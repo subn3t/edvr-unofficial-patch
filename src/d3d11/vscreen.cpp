@@ -32,6 +32,7 @@
 #include "screen_motion.h"
 #include "weapon_motion.h"
 #include "night_vision.h"
+#include "onfoot_look.h"
 #include "device_hook.h"  // contextHookModeFor
 #include "draw_census.h"
 #include "draw_gate.h"    // the sampled subscriber gate the draw path reads
@@ -3150,6 +3151,7 @@ void STDMETHODCALLTYPE hookedClearState(ID3D11DeviceContext* self) {
     }
     forgetBindings(s);
     foveationOnClearState();
+    onFootLookStateCleared();
     // ClearState changes bindings, not resource contents. Retain the
     // captured weapon vertices and attachment inputs across this call.
     s->realClearState(self);
@@ -3255,6 +3257,11 @@ HRESULT STDMETHODCALLTYPE hookedMap(ID3D11DeviceContext* self, ID3D11Resource* r
     if (mapData && drawCensusArmed()) {
         drawCensusCbNoteMap(res, mapped->pData);
     }
+    // The on-foot head look (onfoot_look.h): the per-view buffers' pointers, so
+    // the Unmap can rewrite the main view before the bytes reach the GPU.
+    // Owner-context writes only: a deferred context records on another thread.
+    if (mapData0 && onFootLookEnabled() && self->GetType() != D3D11_DEVICE_CONTEXT_DEFERRED)
+        onFootLookMapped(res, mapped->pData, type);
     // The reveal sync's shadow of the scene block, same tee, its own gate.
     if (mapData && fssRevealWantsDraws()) {
         fssRevealNoteMap(res, mapped->pData);
@@ -3383,6 +3390,10 @@ void STDMETHODCALLTYPE hookedUnmap(ID3D11DeviceContext* self, ID3D11Resource* re
         s->realUnmap(self, res, sub);
         return;
     }
+    // FIRST, before every tee below reads the write: the on-foot head look
+    // rewrites the main view in place, and the tees should see what the GPU
+    // will (onfoot_look.h).
+    if (onFootLookEnabled()) guardedBudget(g_cameraBudget, [&] { onFootLookBeforeUnmap(res); });
     motionResourceWritten(res);
     // Guarded the same way as hookedMap's Map-time tee: with no slot
     // watched, the callee's own loop cannot match this resource either.
@@ -4005,7 +4016,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
     }
     if (!foreignContext(self)) {
         depthProbeNoteIndirectDraw(self, bindingGet(BindSlot::Dsv0));
-        engineVelocityBeforeDraw(self, g_state->rtv0Eye);
+        { engineVelocityBeforeDraw(self, g_state->rtv0Eye); if (onFootLookEnabled()) onFootLookBeforeDraw(); }
         pixelProbeBefore(g_state, self);
     }
     g_state->realDrawIndexedInstancedIndirect(self, args, off);
@@ -4025,7 +4036,7 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
     }
     if (!foreignContext(self)) {
         depthProbeNoteIndirectDraw(self, bindingGet(BindSlot::Dsv0));
-        engineVelocityBeforeDraw(self, g_state->rtv0Eye);
+        { engineVelocityBeforeDraw(self, g_state->rtv0Eye); if (onFootLookEnabled()) onFootLookBeforeDraw(); }
         pixelProbeBefore(g_state, self);
     }
     g_state->realDrawInstancedIndirect(self, args, off);
@@ -4263,7 +4274,7 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
     DrawArgs args;
     args.base = static_cast<int32_t>(start);
     const DrawVerdict v = beginPanelOverride(self, 'D', count, 1, args);
-    if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
+    if (v == DrawVerdict::kNone && self == g_state->ownerCtx) { engineVelocityBeforeDraw(self, g_state->rtv0Eye); if (onFootLookEnabled()) onFootLookBeforeDraw(); }
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
     forwardWithVerdict(self, v, 'D', count, 1, args, [&] {
         const int64_t r0 = clock.on ? qpcNow() : 0;
@@ -4292,7 +4303,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
     args.start = startIndex;
     args.base = baseVertex;
     const DrawVerdict v = beginPanelOverride(self, 'I', count, 1, args);
-    if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
+    if (v == DrawVerdict::kNone && self == g_state->ownerCtx) { engineVelocityBeforeDraw(self, g_state->rtv0Eye); if (onFootLookEnabled()) onFootLookBeforeDraw(); }
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
     forwardWithVerdict(self, v, 'I', count, 1, args, [&] {
         const int64_t r0 = clock.on ? qpcNow() : 0;
@@ -4317,7 +4328,7 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
     args.base = static_cast<int32_t>(startVertex);
     args.startInstance = startInstance;
     const DrawVerdict v = beginPanelOverride(self, 'N', perInstance, instances, args);
-    if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
+    if (v == DrawVerdict::kNone && self == g_state->ownerCtx) { engineVelocityBeforeDraw(self, g_state->rtv0Eye); if (onFootLookEnabled()) onFootLookBeforeDraw(); }
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
     // The draw's instance window, for the glare telemetry: the trains
     // share one record buffer at different offsets, and which train a
@@ -4372,7 +4383,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     // compares; the pool families' substituted shaders and MRT6 are bound
     // only when the game has rebound something since the last look. After the
     // verdict, which refreshes rtv0Eye; a draw a verdict claims is left alone.
-    if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
+    if (v == DrawVerdict::kNone && self == g_state->ownerCtx) { engineVelocityBeforeDraw(self, g_state->rtv0Eye); if (onFootLookEnabled()) onFootLookBeforeDraw(); }
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
     forwardWithVerdict(self, v, 'X', perInstance, instances, args, [&] {
         const int64_t r0 = clock.on ? qpcNow() : 0;
@@ -5078,6 +5089,7 @@ void vScreenRefreshConfig() {
     }
     sunglareConfigure(cfg);
     exposureConfigure(cfg);
+    onFootLookConfigure(cfg);
     panelCurveConfigure(cfg);
     particleConfigure(cfg);
     objectProbeConfigure(cfg);
@@ -5214,6 +5226,7 @@ void vScreenFrameBoundary() {
     if (g_state && g_state->ownerCtx) {
         quadProbeTick(g_state->ownerCtx);
         drawCensusTick(g_state->ownerCtx);
+        onFootLookFrameBoundary();
         objectProbeFrameBoundary(g_state->ownerCtx);
         pixelProbeFrameBoundary(g_state->ownerCtx);
         panelUpscaleFrameEnd();
@@ -6256,6 +6269,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     }
     sunglareConfigure(cfg);
     exposureConfigure(cfg);
+    onFootLookConfigure(cfg);
     panelCurveConfigure(cfg);
     particleConfigure(cfg);
     objectProbeConfigure(cfg);
