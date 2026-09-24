@@ -1,6 +1,7 @@
 #include "onfoot_look.h"
 
 #include <windows.h>
+#include <d3dcompiler.h>
 
 #include <cmath>
 #include <cstdio>
@@ -9,6 +10,7 @@
 
 #include "../common/config.h"
 #include "../common/frame_flag.h"
+#include "../common/guard.h"
 #include "../common/log.h"
 #include "binding_shadow.h"
 #include "draw_census.h"
@@ -19,6 +21,7 @@ namespace edvr {
 
 namespace detail {
 bool g_onFootLookEnabled = false;
+bool g_onFootHeadLocked = false;
 }  // namespace detail
 
 namespace {
@@ -95,9 +98,11 @@ bool Skipped(Part p) { return (g_skip & p) != 0; }
 uint64_t g_frames = 0, g_panelFrames = 0, g_scanned = 0;
 uint64_t g_turnedView = 0, g_turnedClip = 0, g_turnedOthers = 0, g_otherViews = 0, g_noPose = 0, g_offCentre = 0;
 uint64_t g_anyFrame = 0, g_scaled = 0, g_masks = 0, g_pendingFull = 0, g_ambiguous = 0;
+uint64_t g_lockDrawn = 0, g_lockDeclined = 0;
+const char* g_lockWhy = "";
 double g_lastYaw = 0, g_lastPitch = 0, g_lastRoll = 0;
 ULONGLONG g_lastReport = 0;
-bool g_loggedFirst = false;
+bool g_loggedFirst = false, g_loggedLock = false;
 
 bool Near(double v, double target, double tol) { return std::fabs(v - target) < tol; }
 
@@ -491,14 +496,173 @@ void Report() {
                     "main-view writes and %llu views of the main camera through another projection (%llu other views "
                     "left alone); copies turned: %llu in any frame, %llu scaled, %llu shadow masks, in "
                     "%llu scanned writes (%llu missed, every pending slot taken); %llu without a head pose, %llu "
-                    "off-centre, %llu frames with the identity camera; head yaw %.1f pitch %.1f roll %.1f.",
+                    "off-centre, %llu frames with the identity camera; head-locked view: %llu drawn, %llu declined%s%s%s; "
+                    "head yaw %.1f pitch %.1f roll %.1f.",
                     U(g_frames), U(g_panelFrames), U(g_turnedView), U(g_turnedClip), U(g_turnedOthers),
                     U(g_otherViews), U(g_anyFrame), U(g_scaled), U(g_masks), U(g_scanned),
-                    U(g_pendingFull), U(g_noPose), U(g_offCentre), U(g_ambiguous), g_lastYaw, g_lastPitch,
+                    U(g_pendingFull), U(g_noPose), U(g_offCentre), U(g_ambiguous), U(g_lockDrawn), U(g_lockDeclined),
+                    g_lockDeclined ? " (last: " : "", g_lockDeclined ? g_lockWhy : "", g_lockDeclined ? ")" : "",
+                    g_lastYaw, g_lastPitch,
                     g_lastRoll);
     g_frames = g_panelFrames = g_turnedView = g_turnedClip = g_turnedOthers = g_otherViews = 0;
     g_anyFrame = g_scaled = g_masks = g_scanned = g_pendingFull = 0;
     g_noPose = g_offCentre = g_ambiguous = 0;
+    g_lockDrawn = g_lockDeclined = 0;
+}
+
+// --- the head-locked view (onfoot_look.h) ----------------------------------
+
+// b1's clip transform by columns as last written, after any turn: at the
+// panel composite, the eye's (its projection times its view).
+float g_eyeClip[16] = {};
+bool g_eyeClipValid = false;
+
+ID3D11Device* g_lockDevice = nullptr;
+ID3D11VertexShader* g_lockVs = nullptr;
+ID3D11Buffer* g_lockCb = nullptr;
+ID3D11DepthStencilState* g_lockDss = nullptr;
+bool g_lockFailed = false;
+FaultBudget g_lockBudget("onfootLook.headLocked", 3);
+
+// One quad from SV_VertexID, corners TL TR BL BR in clip space from b0,
+// wound clockwise like the game's; the output signature is the game's
+// composite VS's (vs_5C36AF051B98B9F1), which its pixel shader links to.
+constexpr char kLockVs[] =
+    "cbuffer C : register(b0) { float4 corner[4]; };\n"
+    "struct O { float2 uv : __USER_VERTEX_M_TEXCOORD0; float4 pos : SV_Position; };\n"
+    "static const uint k[6] = { 0, 1, 3, 0, 3, 2 };\n"
+    "O main(uint id : SV_VertexID) {\n"
+    "    const uint c = k[id];\n"
+    "    O o;\n"
+    "    o.uv = float2(c & 1, c >> 1);\n"
+    "    o.pos = corner[c];\n"
+    "    return o;\n"
+    "}\n";
+
+void ReleaseLock() {
+    if (g_lockVs) g_lockVs->Release();
+    if (g_lockCb) g_lockCb->Release();
+    if (g_lockDss) g_lockDss->Release();
+    g_lockVs = nullptr;
+    g_lockCb = nullptr;
+    g_lockDss = nullptr;
+}
+
+bool EnsureLock(ID3D11DeviceContext* ctx) {
+    ID3D11Device* device = nullptr;
+    ctx->GetDevice(&device);
+    if (!device) return false;
+    device->Release();  // the context holds it
+    if (device == g_lockDevice && g_lockVs) return true;
+    ReleaseLock();
+    g_lockDevice = device;
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* errors = nullptr;
+    const HRESULT hr = D3DCompile(kLockVs, sizeof(kLockVs) - 1, "onfoot_lock_vs", nullptr, nullptr, "main", "vs_5_0",
+                                  0, 0, &blob, &errors);
+    if (errors) {
+        Log::get().note("onfoot look: head-locked view shader: %s",
+                        static_cast<const char*>(errors->GetBufferPointer()));
+        errors->Release();
+    }
+    if (FAILED(hr) || !blob) return false;
+    const bool vs =
+        SUCCEEDED(device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &g_lockVs));
+    blob->Release();
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = 64;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    D3D11_DEPTH_STENCIL_DESC dd{};
+    dd.DepthEnable = FALSE;
+    dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    dd.StencilEnable = FALSE;
+    if (!vs || FAILED(device->CreateBuffer(&bd, nullptr, &g_lockCb)) ||
+        FAILED(device->CreateDepthStencilState(&dd, &g_lockDss))) {
+        ReleaseLock();
+        return false;
+    }
+    return true;
+}
+
+bool Decline(const char* why) {
+    ++g_lockDeclined;
+    g_lockWhy = why;
+    return false;
+}
+
+double Dot3(const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+// The corners in the eye's clip space: directions F + X tx R + Y ty U, with
+// (tx, ty) the main projection's tangents, projected by the eye's own rows.
+// False when b1's slot does not hold an eye-like transform.
+bool LockCorners(float out[16]) {
+    const float* e = g_eyeClip;
+    double row[4][3];
+    for (int k = 0; k < 4; ++k)
+        for (int i = 0; i < 3; ++i) row[k][i] = e[4 * i + k];
+    const double lf = std::sqrt(Dot3(row[3], row[3]));
+    if (!Near(lf, 1, 1e-2)) return false;
+    double f[3], r[3], u[3];
+    for (int i = 0; i < 3; ++i) f[i] = row[3][i] / lf;
+    const double rf = Dot3(row[0], f), uf = Dot3(row[1], f);
+    for (int i = 0; i < 3; ++i) {
+        r[i] = row[0][i] - rf * f[i];
+        u[i] = row[1][i] - uf * f[i];
+    }
+    const double lr = std::sqrt(Dot3(r, r)), lu = std::sqrt(Dot3(u, u));
+    if (lr < 1e-3 || lu < 1e-3) return false;
+    for (int i = 0; i < 3; ++i) {
+        r[i] /= lr;
+        u[i] /= lu;
+    }
+    const double tx = 1 / g_mainScale[0], ty = 1 / g_mainScale[1];
+    const int kCorner[4][2] = {{-1, 1}, {1, 1}, {-1, -1}, {1, -1}};
+    for (int c = 0; c < 4; ++c) {
+        double d[3];
+        for (int i = 0; i < 3; ++i) d[i] = f[i] + kCorner[c][0] * tx * r[i] + kCorner[c][1] * ty * u[i];
+        const double w = Dot3(row[3], d);
+        if (w <= 0) return false;
+        out[4 * c + 0] = static_cast<float>(Dot3(row[0], d));
+        out[4 * c + 1] = static_cast<float>(Dot3(row[1], d));
+        out[4 * c + 2] = static_cast<float>(0.5 * w);  // mid-depth; the depth test is off for the draw
+        out[4 * c + 3] = static_cast<float>(w);
+    }
+    return true;
+}
+
+// The game's state the draw changes, at module scope so the fault path can
+// put it back.
+struct LockSaved {
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11ClassInstance* inst[256] = {};
+    UINT instCount = 256;
+    ID3D11Buffer* cb0 = nullptr;
+    ID3D11InputLayout* layout = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ID3D11DepthStencilState* dss = nullptr;
+    UINT stencilRef = 0;
+    bool held = false;
+} g_lockSaved;
+
+void LockRestore(ID3D11DeviceContext* ctx) {
+    LockSaved& s = g_lockSaved;
+    if (!s.held) return;
+    s.held = false;
+    ctx->VSSetShader(s.vs, s.instCount ? s.inst : nullptr, s.instCount);
+    ctx->VSSetConstantBuffers(0, 1, &s.cb0);
+    ctx->IASetInputLayout(s.layout);
+    ctx->IASetPrimitiveTopology(s.topo);
+    ctx->OMSetDepthStencilState(s.dss, s.stencilRef);
+    if (s.vs) s.vs->Release();
+    for (UINT i = 0; i < s.instCount; ++i)
+        if (s.inst[i]) s.inst[i]->Release();
+    if (s.cb0) s.cb0->Release();
+    if (s.layout) s.layout->Release();
+    if (s.dss) s.dss->Release();
+    s = LockSaved{};
 }
 
 // --- capture: the census key (hotkey.dump_draws) on foot ---------------------
@@ -588,6 +752,12 @@ void onFootLookConfigure(Config& cfg) {
                              "it is and shows the turned view)."
                            : "onfoot look: off.");
     detail::g_onFootLookEnabled = on;
+    const bool locked = cfg.getBool("experimental.onfoot_head_locked", false);
+    if (locked != detail::g_onFootHeadLocked)
+        Log::get().note(locked ? "onfoot look: head-locked view ON (with the head look on, the on-foot screen is drawn "
+                                 "in each eye at the game's own field of view)."
+                               : "onfoot look: head-locked view off.");
+    detail::g_onFootHeadLocked = locked;
     const std::string skip = cfg.getString("experimental.onfoot_head_look_skip", "");
     unsigned mask = 0;
     const struct {
@@ -615,7 +785,7 @@ void onFootLookBeforeDraw() {
 }
 
 void onFootLookMapped(ID3D11Resource* res, void* data, D3D11_MAP type) {
-    if (!detail::g_onFootLookEnabled || type == D3D11_MAP_READ || !res) return;
+    if (!detail::g_onFootLookEnabled || type == D3D11_MAP_READ || !res || res == g_lockCb) return;
     if (res == g_viewCb) {
         g_viewData = data;
         return;
@@ -670,6 +840,8 @@ void onFootLookBeforeUnmap(ID3D11Resource* res) {
             TurnCopies(work, g_frameFloats, {kClipOffset / 4, kClipOffset / 4 + 16},
                        {kPrevPoseOffset / 4, kPrevPoseOffset / 4 + 12});
         memcpy(g_frameData, work, g_frameFloats * 4);
+        memcpy(g_eyeClip, work + kClipOffset / 4, sizeof(g_eyeClip));
+        g_eyeClipValid = true;
         g_frameData = nullptr;
     } else {
         for (Pending& p : g_pending) {
@@ -709,6 +881,54 @@ void onFootLookFrameBoundary() {
         g_rtvGen = g_dsvGen = 0;  // re-test the bound target against the new size
     }
     Report();
+}
+
+bool onFootLookDrawHeadLocked(ID3D11DeviceContext* ctx, OnFootDrawFn draw) {
+    if (!onFootLookHeadLockedWanted() || g_lockFailed || !ctx || !draw) return false;
+    if (!g_haveMain || !(g_foundThisFrame || g_panelLastFrame)) return Decline("no panel scene");
+    if (!g_eyeClipValid || bindingGet(BindSlot::VsCb1) != g_frameCb) return Decline("the composite reads another b1");
+    float corners[16];
+    if (!LockCorners(corners)) return Decline("b1's slot is not an eye transform");
+    bool drawn = false;
+    const bool ok = guardedBudget(g_lockBudget, [&] {
+        if (!EnsureLock(ctx)) {
+            g_lockFailed = true;
+            Log::get().note("onfoot look: head-locked view could not build its shader or states; the screen stays.");
+            return;
+        }
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(ctx->Map(g_lockCb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)) || !m.pData) return;
+        memcpy(m.pData, corners, sizeof(corners));
+        ctx->Unmap(g_lockCb, 0);
+        LockSaved& s = g_lockSaved;
+        ctx->VSGetShader(&s.vs, s.inst, &s.instCount);
+        ctx->VSGetConstantBuffers(0, 1, &s.cb0);
+        ctx->IAGetInputLayout(&s.layout);
+        ctx->IAGetPrimitiveTopology(&s.topo);
+        ctx->OMGetDepthStencilState(&s.dss, &s.stencilRef);
+        s.held = true;
+        ctx->VSSetShader(g_lockVs, nullptr, 0);
+        ctx->VSSetConstantBuffers(0, 1, &g_lockCb);
+        ctx->IASetInputLayout(nullptr);
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx->OMSetDepthStencilState(g_lockDss, 0);
+        draw(ctx, 6, 0);
+        LockRestore(ctx);
+        drawn = true;
+    });
+    if (!ok) {
+        guarded("onfootLook.headLockedRestore", [&] { LockRestore(ctx); });
+        g_lockFailed = true;
+        Log::get().note("onfoot look: head-locked view faulted; the screen stays for this session.");
+        return false;
+    }
+    if (!drawn) return Decline("the draw could not be set up");
+    if (++g_lockDrawn == 1 && !g_loggedLock) {
+        g_loggedLock = true;
+        Log::get().note("onfoot look: head-locked view drawn (tangents x %.3f y %.3f).", 1 / g_mainScale[0],
+                        1 / g_mainScale[1]);
+    }
+    return true;
 }
 
 }  // namespace edvr
