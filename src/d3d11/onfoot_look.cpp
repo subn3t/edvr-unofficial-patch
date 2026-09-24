@@ -71,6 +71,17 @@ bool g_foundThisFrame = false;
 bool g_panelLastFrame = false;
 uint32_t g_panelW = 0, g_panelH = 0;  // refreshed each frame
 
+// A target of the on-foot scene: the panel's shape at any render scale. The
+// game's supersampling and upscaling render the scene smaller or larger than
+// the panel (EDVR's vscreen_res_width); taken at exactly the panel's size,
+// the "VR Medium" preset's lower scale turned the head look, the eyes and
+// the shadow mask off (2026-09-24).
+bool SceneSized(double w, double h) {
+    if (!g_panelW || !g_panelH || w < 1 || h < 1) return false;
+    if (std::fabs(w * g_panelH - h * g_panelW) > 0.01 * w * g_panelH) return false;
+    return w >= 0.3 * g_panelW && w <= 2.5 * g_panelW;
+}
+
 // The render-target check, cached by the binding shadow's generations.
 uint32_t g_rtvGen = 0, g_dsvGen = 0;
 bool g_stereoDiag = false;  // experimental.onfoot_stereo_diag: eye-sized G-buffers count too
@@ -574,7 +585,7 @@ void TurnCopies(float* f, UINT floats, Range skipA = {}, Range skipB = {}) {
 // them. The turned camera's is Q^T R L^T, Q^T times the rows.
 bool TurnMask(float* f, UINT floats) {
     if (floats != 592 / 4 || Skipped(kPartMask)) return false;
-    if (f[0] != static_cast<float>(g_panelW) || f[1] != static_cast<float>(g_panelH)) return false;
+    if (!SceneSized(f[0], f[1])) return false;
     float* v = f + 28;
     for (int i = 0; i < 3; ++i)
         if (!Unit(v + 4 * i) || v[4 * i + 3] != 0.0f) return false;
@@ -623,7 +634,7 @@ bool PanelGBufferBound() {
         tex->GetDesc(&td);
         g_lastGbufW = td.Width;
         g_lastGbufH = td.Height;
-        g_rtvIsPanelGBuffer = td.Width == g_panelW && td.Height == g_panelH;
+        g_rtvIsPanelGBuffer = SceneSized(td.Width, td.Height);
         g_rtvIsAnyGBuffer = td.Width >= 1024;
         tex->Release();
     }
@@ -1128,7 +1139,7 @@ int PipeOfDraw() {
             D3D11_TEXTURE2D_DESC td;
             tex->GetDesc(&td);
             tex->Release();
-            if (td.Width == g_panelW && td.Height == g_panelH) {
+            if (SceneSized(td.Width, td.Height)) {
                 if (g_pipeTargetCount == kMaxPipeTargets) g_pipeTargetCount = 0;
                 g_curPipe = g_lastPipe >= 0 ? 1 - g_lastPipe : 0;
                 g_pipeTargets[g_pipeTargetCount++] = {res, g_curPipe};
