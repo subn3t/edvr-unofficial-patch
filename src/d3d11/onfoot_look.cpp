@@ -50,6 +50,7 @@ UINT g_viewBytes = 0, g_frameFloats = 0;
 // write the frame's first panel G-buffer draw used.
 bool g_haveMain = false;
 double g_mainScale[2] = {}, g_mainNear = 0;
+bool g_mainCentred = false;  // the x row has no forward part: a flat view, not an eye's asymmetric one
 
 // Per-frame learning, and whether the panel scene ran last frame (the turn
 // is armed only then: in the cockpit the G-buffer is eye-sized).
@@ -180,9 +181,16 @@ float g_b0Copy[64] = {};
 float g_b1Copy[kMaxScanBytes / 4] = {};
 UINT g_b0CopyBytes = 0, g_b1CopyBytes = 0;
 double g_b0Sx = 0, g_b1Sx = 0;
+// experimental.onfoot_stereo_near_eye: the share of the eye offset given to
+// writes in VIEW space (the camera's own axes, before the head's turn: the
+// first-person body and what it holds). A first-person weapon drawn smaller
+// and nearer than it is -- so it does not pass through walls -- takes the
+// whole offset as if it were that near, and the eyes cannot fuse it (the
+// pistol, flight of 2026-09-24).
+double g_nearEye = 1.0;
 int g_b0Pipe = -1, g_b1Pipe = -1;
 bool g_viewDiscard = false, g_frameDiscard = false;  // the game's Map of b0 / b1 was a discard
-uint64_t g_moved = 0, g_rewrites = 0, g_rewriteFails = 0, g_notDiscard = 0, g_newTargets = 0;
+uint64_t g_moved = 0, g_movedNear = 0, g_rewrites = 0, g_rewriteFails = 0, g_notDiscard = 0, g_newTargets = 0;
 
 
 bool Near(double v, double target, double tol) { return std::fabs(v - target) < tol; }
@@ -233,8 +241,16 @@ void TakeHeadRotation() {
     g_lastRoll = std::atan2(g_q[1][0], g_q[1][1]) * kDeg;
 }
 
+// Only on foot, with a centred main view. With the on-foot stereo the ship,
+// once visited on foot, keeps rendering into panel-sized targets (the
+// display mode never changes back), so the panel test alone passes in the
+// cockpit: its asymmetric eye views were refused as off-centre, but the
+// shadow mask turned, and the cockpit's shadows swung with the head (flight
+// of 2026-09-24). The journal says where the player is; the centred test
+// holds until it does.
 bool Armed() {
-    if (!g_panelLastFrame || !g_haveMain) return false;
+    if (!g_panelLastFrame || !g_haveMain || !g_mainCentred) return false;
+    if (journalOnFootKnown() && !journalOnFoot()) return false;
     TakeHeadRotation();
     if (!g_qValid) {
         ++g_noPose;
@@ -307,7 +323,8 @@ bool TurnSameCamera(float* rows) {
 // the centre -- with the head-locked view the panel's corners sit at the edge
 // of the headset's field.
 bool ScaleHud(float* rows) {
-    if (g_hudScale == 1.0f || !g_haveMain || !g_panelLastFrame) return false;
+    if (g_hudScale == 1.0f || !g_haveMain || !g_panelLastFrame || !g_mainCentred) return false;
+    if (journalOnFootKnown() && !journalOnFoot()) return false;
     const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
     if (sy < 1e-6 || !Near(sw, 1, 1e-3) || sx < 1.1 * g_mainScale[0]) return false;
     const double aspect = g_mainScale[0] / g_mainScale[1];
@@ -573,6 +590,10 @@ void Learn() {
     g_mainScale[1] = RowLength(g_viewShadow + 4);
     g_mainNear = z[3];
     g_haveMain = true;
+    const double wl = RowLength(g_viewShadow + 12);
+    const double xw = double(g_viewShadow[0]) * g_viewShadow[12] + double(g_viewShadow[1]) * g_viewShadow[13] +
+                      double(g_viewShadow[2]) * g_viewShadow[14];
+    g_mainCentred = wl > 1e-6 && std::fabs(xw) < 1e-3 * g_mainScale[0] * wl;
     if (!had)
         Log::get().note("onfoot look: main view projection x %.4f y %.4f near %.4g.", g_mainScale[0], g_mainScale[1],
                         g_mainNear);
@@ -600,14 +621,14 @@ void Report() {
                     "%llu scanned writes (%llu missed, every pending slot taken); %llu without a head pose, %llu "
                     "off-centre, %llu frames with the identity camera; head-locked view: %llu drawn, %llu declined%s%s%s, "
                     "%llu timewarped (largest %.2f degrees); %llu HUD views scaled; "
-                    "stereo: %s, %llu camera writes moved, %llu written again for the other eye (%llu failed, %llu "
+                    "stereo: %s, %llu camera writes moved (%llu in view space, x%.2f), %llu written again for the other eye (%llu failed, %llu "
                     "not discards), %llu new eye targets, left eye = %s pipeline%s, half IPD %.2f mm; "
                     "head yaw %.1f pitch %.1f roll %.1f.",
                     U(g_frames), U(g_panelFrames), U(g_turnedView), U(g_turnedClip), U(g_turnedOthers),
                     U(g_otherViews), U(g_anyFrame), U(g_scaled), U(g_masks), U(g_scanned),
                     U(g_pendingFull), U(g_noPose), U(g_offCentre), U(g_ambiguous), U(g_lockDrawn), U(g_lockDeclined),
                     g_lockDeclined ? " (last: " : "", g_lockDeclined ? g_lockWhy : "", g_lockDeclined ? ")" : "",
-                    U(g_lockWarped), g_lockWarpMaxDeg, U(g_hudScaled), g_stereoOn ? "on" : "off", U(g_moved),
+                    U(g_lockWarped), g_lockWarpMaxDeg, U(g_hudScaled), g_stereoOn ? "on" : "off", U(g_moved), U(g_movedNear), g_nearEye,
                     U(g_rewrites), U(g_rewriteFails), U(g_notDiscard), U(g_newTargets),
                     g_leftPipe == 0 ? "first" : "second", g_leftKnown ? "" : " (assumed)", g_halfIpd * 1000,
                     g_lastYaw, g_lastPitch,
@@ -616,7 +637,7 @@ void Report() {
     g_anyFrame = g_scaled = g_masks = g_scanned = g_pendingFull = 0;
     g_noPose = g_offCentre = g_ambiguous = 0;
     g_lockDrawn = g_lockDeclined = g_lockWarped = g_hudScaled = 0;
-    g_moved = g_rewrites = g_rewriteFails = g_notDiscard = g_newTargets = 0;
+    g_moved = g_movedNear = g_rewrites = g_rewriteFails = g_notDiscard = g_newTargets = 0;
     g_lockWarpMaxDeg = 0;
 }
 
@@ -931,15 +952,27 @@ double MoveScale(const float* rows) {
     return sx / sw;
 }
 
+// A clip transform's rows (by rows) whose axes are the identity's: a write
+// in view space, taken before the head's turn.
+bool ViewSpaceRows(const float* rows) {
+    const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
+    if (sx < 1e-6 || sy < 1e-6 || sw < 1e-6) return false;
+    return std::fabs(rows[0] / sx - 1) < 1e-4 && std::fabs(rows[5] / sy - 1) < 1e-4 && std::fabs(rows[14] / sw - 1) < 1e-4;
+}
+
 int PredictPipe() { return g_curPipe >= 0 ? g_curPipe : (g_lastPipe >= 0 ? g_lastPipe : 0); }
 
 // b0 as the game wrote it and the head look turned it (mapped, write-combined;
 // rows the turned rows already read out): kept, and moved for a pipeline.
-void StereoViewWritten(float* mapped, const float* rows) {
+void StereoViewWritten(float* mapped, const float* rows, bool viewSpace) {
     g_b0Sx = 0;
     if (!g_stereoOn || g_viewBytes > sizeof(g_b0Copy)) return;
-    const double sx = MoveScale(rows);
+    double sx = MoveScale(rows);
     if (sx <= 0) return;
+    if (viewSpace) {
+        sx *= g_nearEye;
+        ++g_movedNear;
+    }
     if (!g_viewDiscard) {
         ++g_notDiscard;
         return;
@@ -953,15 +986,19 @@ void StereoViewWritten(float* mapped, const float* rows) {
 }
 
 // b1 in ordinary memory, turned, before it is written back.
-void StereoFrameWritten(float* work) {
+void StereoFrameWritten(float* work, bool viewSpace) {
     g_b1Sx = 0;
     if (!g_stereoOn) return;
     const float* c = work + kClipOffset / 4;
     float rows[16];
     for (int r = 0; r < 4; ++r)
         for (int col = 0; col < 4; ++col) rows[4 * r + col] = c[4 * col + r];
-    const double sx = MoveScale(rows);
+    double sx = MoveScale(rows);
     if (sx <= 0) return;
+    if (viewSpace) {
+        sx *= g_nearEye;
+        ++g_movedNear;
+    }
     if (!g_frameDiscard) {
         ++g_notDiscard;
         return;
@@ -1230,6 +1267,12 @@ void onFootLookConfigure(Config& cfg) {
     if (ipd != g_ipdMm)
         Log::get().note("onfoot stereo: IPD %s.", ipd > 0 ? "from onfoot_stereo_ipd_mm" : (ipd == 0 ? "the headset's" : "none: the eyes are not moved"));
     g_ipdMm = ipd;
+    const float nearEye = cfg.getFloat("experimental.onfoot_stereo_near_eye", 1.0f);
+    const double nearClamped = nearEye < 0 ? 0.0 : (nearEye > 1 ? 1.0 : nearEye);
+    if (nearClamped != g_nearEye)
+        Log::get().note("onfoot stereo: view-space draws (the body, what it holds) take %.2f of the eye offset.",
+                        nearClamped);
+    g_nearEye = nearClamped;
     if (!on) {
         if (g_stereoWasOn) setOnFootFlat(false, 0, 0);
         g_stereoOn = g_stereoWasOn = false;
@@ -1297,10 +1340,12 @@ void onFootLookBeforeUnmap(ID3D11Resource* res) {
     }
     if (res == g_viewCb && g_viewData) {
         float* a = reinterpret_cast<float*>(static_cast<char*>(g_viewData) + kViewOffset);
+        float before[16];
+        if (g_stereoOn) memcpy(before, a, sizeof(before));
         TurnView(a);
         memcpy(g_viewShadow, a, sizeof(g_viewShadow));
         g_viewShadowFresh = true;
-        StereoViewWritten(static_cast<float*>(g_viewData), g_viewShadow);
+        StereoViewWritten(static_cast<float*>(g_viewData), g_viewShadow, g_stereoOn && ViewSpaceRows(before));
         g_viewData = nullptr;
     } else if (res == g_frameCb && g_frameData) {
         // The view slot (4320) is turned only for the main view; every b1
@@ -1309,11 +1354,19 @@ void onFootLookBeforeUnmap(ID3D11Resource* res) {
         // in ordinary memory and written back whole (see TurnBuffer).
         static float work[kMaxScanBytes / 4];
         memcpy(work, g_frameData, g_frameFloats * 4);
+        bool viewSpace = false;
+        if (g_stereoOn) {
+            float rows[16];
+            const float* c = work + kClipOffset / 4;
+            for (int r = 0; r < 4; ++r)
+                for (int col = 0; col < 4; ++col) rows[4 * r + col] = c[4 * col + r];
+            viewSpace = ViewSpaceRows(rows);
+        }
         TurnClip(work + kClipOffset / 4);
         if (Armed())
             TurnCopies(work, g_frameFloats, {kClipOffset / 4, kClipOffset / 4 + 16},
                        {kPrevPoseOffset / 4, kPrevPoseOffset / 4 + 12});
-        StereoFrameWritten(work);
+        StereoFrameWritten(work, viewSpace);
         memcpy(g_frameData, work, g_frameFloats * 4);
         memcpy(g_eyeClip, work + kClipOffset / 4, sizeof(g_eyeClip));
         g_eyeClipValid = true;
