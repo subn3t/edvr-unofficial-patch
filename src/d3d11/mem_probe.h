@@ -17,6 +17,10 @@
 //                                           three) for probe_watch_ms: every
 //                                           writer (rw: reader too) with the
 //                                           game's stack and its registers
+//   probe_find  = <expr>; ...               every aligned qword equal to the
+//                                           value (up to four; an object by
+//                                           its vtable: base+<RVA>), stacks
+//                                           skipped, on a thread of its own
 //   probe_repeat_ms = N                     repeat the peeks every N ms (0 once)
 //   probe_run = N                           change to run again as they are
 //

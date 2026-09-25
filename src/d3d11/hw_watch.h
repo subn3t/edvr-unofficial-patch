@@ -30,4 +30,14 @@ void hwWatchDisarm();
 // the image [base, base + size): up to cap, innermost first.
 uint32_t unwindGameStack(const CONTEXT& start, uintptr_t base, uint64_t size, uint32_t* out, uint32_t cap) noexcept;
 
+// The same walk with each game frame's nonvolatile registers as that
+// function had them (the unwind restores what its callees saved): a caller's
+// object pointer, found at the frame that owns it. The first entry is the
+// trapping function itself when it is the game's.
+struct GameFrame {
+    uint32_t rva;
+    uint64_t rbx, rbp, rsi, rdi, r12, r13, r14, r15;
+};
+uint32_t unwindGameFrames(const CONTEXT& start, uintptr_t base, uint64_t size, GameFrame* out, uint32_t cap) noexcept;
+
 }  // namespace edvr

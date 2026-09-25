@@ -176,13 +176,123 @@ void RunPeeks() {
     }
 }
 
+// --- the find: every aligned qword equal to a value --------------------------
+//
+// An object is found by its vtable: probe_find = base+<vtable RVA> lists every
+// instance of the class. The process's private read-write memory, stacks
+// skipped, on a thread of its own; the hits logged when it is done.
+
+constexpr int kMaxFindValues = 4, kMaxFindHits = 48;
+uint64_t g_findValue[kMaxFindValues] = {};
+std::string g_findItem[kMaxFindValues];
+int g_findCount = 0;
+uintptr_t g_findHits[kMaxFindValues][kMaxFindHits];
+volatile LONG g_findHitCount[kMaxFindValues] = {};
+volatile LONG g_findRunning = 0, g_findDone = 0;
+std::string g_findText;
+bool g_findPending = false;
+ULONGLONG g_findStartMs = 0;
+
+bool IsStackAllocation(uintptr_t allocationBase) {
+    MEMORY_BASIC_INFORMATION m{};
+    uintptr_t p = allocationBase;
+    for (int i = 0; i < 64 && VirtualQuery(reinterpret_cast<const void*>(p), &m, sizeof(m)) == sizeof(m); ++i) {
+        if (reinterpret_cast<uintptr_t>(m.AllocationBase) != allocationBase) break;
+        if (m.State == MEM_COMMIT && (m.Protect & PAGE_GUARD)) return true;
+        p = reinterpret_cast<uintptr_t>(m.BaseAddress) + m.RegionSize;
+    }
+    return false;
+}
+
+DWORD WINAPI FindProc(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    constexpr SIZE_T kChunk = 1u << 20;
+    uint64_t* buf = static_cast<uint64_t*>(VirtualAlloc(nullptr, kChunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (buf) {
+        const uintptr_t bufLo = reinterpret_cast<uintptr_t>(buf), bufHi = bufLo + kChunk;
+        MEMORY_BASIC_INFORMATION mbi{};
+        uintptr_t p = 0x10000, lastAlloc = 0;
+        bool lastStack = false;
+        while (p < 0x7FFFFFFF0000ull &&
+               VirtualQuery(reinterpret_cast<const void*>(p), &mbi, sizeof(mbi)) == sizeof(mbi)) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress), end = base + mbi.RegionSize;
+            const bool rw = (mbi.Protect & 0xFF) == PAGE_READWRITE && !(mbi.Protect & (PAGE_GUARD | PAGE_NOCACHE));
+            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && rw && !(base < bufHi && end > bufLo)) {
+                const uintptr_t alloc = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+                if (alloc != lastAlloc) {
+                    lastAlloc = alloc;
+                    lastStack = IsStackAllocation(alloc);
+                }
+                for (uintptr_t at = base; !lastStack && at < end; at += kChunk) {
+                    const SIZE_T n = static_cast<SIZE_T>(end - at < kChunk ? end - at : kChunk);
+                    if (!ReadOwn(at, buf, n)) continue;
+                    for (SIZE_T k = 0; k < n / 8; ++k)
+                        for (int v = 0; v < g_findCount; ++v)
+                            if (buf[k] == g_findValue[v]) {
+                                const LONG i = InterlockedIncrement(&g_findHitCount[v]) - 1;
+                                if (i < kMaxFindHits) g_findHits[v][i] = at + k * 8;
+                            }
+                }
+            }
+            if (end <= p) break;
+            p = end;
+        }
+        VirtualFree(buf, 0, MEM_RELEASE);
+    }
+    InterlockedExchange(&g_findDone, 1);
+    return 0;
+}
+
+void StartFind() {
+    std::string items[kMaxFindValues];
+    const int n = Split(g_findText, items, kMaxFindValues);
+    g_findCount = 0;
+    for (int i = 0; i < n; ++i) {
+        Parser ps{items[i].c_str()};
+        const uint64_t v = ps.Expr();
+        if (!ps.ok) {
+            Log::get().note("probe: find %d (%s): cannot evaluate.", i + 1, items[i].c_str());
+            continue;
+        }
+        g_findItem[g_findCount] = items[i];
+        g_findValue[g_findCount] = v;
+        g_findHitCount[g_findCount] = 0;
+        ++g_findCount;
+    }
+    if (!g_findCount) return;
+    g_findDone = 0;
+    HANDLE h = CreateThread(nullptr, 0, &FindProc, nullptr, 0, nullptr);
+    if (!h) return;
+    CloseHandle(h);
+    g_findRunning = 1;
+    g_findStartMs = GetTickCount64();
+    Log::get().note("probe: finding %d value(s) in the game's memory...", g_findCount);
+}
+
+void EndFind() {
+    g_findRunning = 0;
+    for (int v = 0; v < g_findCount; ++v) {
+        const LONG hits = g_findHitCount[v];
+        Log::get().note("probe: find %d (%s = %016llX): %ld hit(s) in %llu ms.", v + 1, g_findItem[v].c_str(),
+                        static_cast<unsigned long long>(g_findValue[v]), static_cast<long>(hits),
+                        static_cast<unsigned long long>(GetTickCount64() - g_findStartMs));
+        for (LONG i = 0; i < hits && i < kMaxFindHits; i += 6) {
+            char line[512];
+            int k = snprintf(line, sizeof(line), "probe:   at");
+            for (LONG j = i; j < i + 6 && j < hits && j < kMaxFindHits; ++j)
+                k += snprintf(line + k, sizeof(line) - k, " %p", reinterpret_cast<void*>(g_findHits[v][j]));
+            Log::get().note("%s", line);
+        }
+    }
+}
+
 // --- the watch --------------------------------------------------------------
 
 constexpr int kMaxHits = 8, kMaxFrames = 12;
 struct Hit {
     volatile LONG count;
     uint32_t rip;
-    uint32_t frames[kMaxFrames];
+    GameFrame frames[kMaxFrames];  // the game's frames, each with its nonvolatile registers
     uint32_t n;
     uint64_t regs[16];  // rax rcx rdx rbx rsp rbp rsi rdi r8..r15 at the first
 };
@@ -222,7 +332,7 @@ LONG CALLBACK ProbeVeh(EXCEPTION_POINTERS* ep) {
             continue;
         }
         Hit& h = g_hits[s][i];
-        h.n = unwindGameStack(c, g_base, g_imageSize, h.frames, kMaxFrames);
+        h.n = unwindGameFrames(c, g_base, g_imageSize, h.frames, kMaxFrames);
         const DWORD64 regs[16] = {c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi,
                                   c.R8,  c.R9,  c.R10, c.R11, c.R12, c.R13, c.R14, c.R15};
         for (int k = 0; k < 16; ++k) h.regs[k] = regs[k];
@@ -307,7 +417,7 @@ void EndWatch() {
             int k = 0;
             frames[0] = 0;
             for (uint32_t f = 0; f < h.n && k < static_cast<int>(sizeof(frames)) - 16; ++f)
-                k += snprintf(frames + k, sizeof(frames) - k, " +0x%X", h.frames[f]);
+                k += snprintf(frames + k, sizeof(frames) - k, " +0x%X", h.frames[f].rva);
             Log::get().note("probe: watch %d (%s = %p) %s %ld times at +0x%X (the instruction before); stack:%s",
                             s + 1, g_watchItem[s].c_str(), reinterpret_cast<void*>(g_watchAddr[s]), what,
                             static_cast<long>(h.count), h.rip, frames);
@@ -316,6 +426,17 @@ void EndWatch() {
                             "%llX r8 %llX r9 %llX r10 %llX r11 %llX r12 %llX r13 %llX r14 %llX r15 %llX",
                             r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13],
                             r[14], r[15]);
+            // Each frame's own registers: a caller's object where it held it.
+            for (uint32_t f = 0; f < h.n && f < 8; ++f) {
+                const GameFrame& g = h.frames[f];
+                char an[8][48];
+                const uint64_t v[8] = {g.rbx, g.rbp, g.rsi, g.rdi, g.r12, g.r13, g.r14, g.r15};
+                for (int i = 0; i < 8; ++i) Annotate(v[i], an[i], sizeof(an[i]));
+                Log::get().note("probe:   frame +0x%X: rbx %llX%s rbp %llX%s rsi %llX%s rdi %llX%s r12 %llX%s r13 %llX%s "
+                                "r14 %llX%s r15 %llX%s",
+                                g.rva, v[0], an[0], v[1], an[1], v[2], an[2], v[3], an[3], v[4], an[4], v[5], an[5], v[6],
+                                an[6], v[7], an[7]);
+            }
         }
         if (g_overflow[s])
             Log::get().note("probe: watch %d: %ld hits by more code than kept.", s + 1,
@@ -338,24 +459,32 @@ void memProbeConfigure(Config& cfg) {
     }
     const std::string peek = cfg.getString("experimental.probe_peek", "");
     const std::string watch = cfg.getString("experimental.probe_watch", "");
+    const std::string find = cfg.getString("experimental.probe_find", "");
     const int run = cfg.getInt("experimental.probe_run", 0);
     const int repeat = cfg.getInt("experimental.probe_repeat_ms", 0);
     const int watchMs = cfg.getInt("experimental.probe_watch_ms", 3000);
     const bool again = run != g_run;
     if (peek != g_peekText || (again && !peek.empty())) g_peekPending = !peek.empty();
     if (watch != g_watchText || (again && !watch.empty())) g_watchPending = !watch.empty();
+    if (find != g_findText || (again && !find.empty())) g_findPending = !find.empty();
     g_peekText = peek;
     g_watchText = watch;
+    g_findText = find;
     g_run = run;
     g_repeatMs = repeat <= 0 ? 0 : (repeat < 100 ? 100 : repeat);
     g_watchMs = watchMs < 250 ? 250 : (watchMs > 30000 ? 30000 : watchMs);
-    if (g_peekPending || g_watchPending)
-        Log::get().note("probe: %s%s%s at the next frame (image base %p).", g_peekPending ? "peek" : "",
-                        g_peekPending && g_watchPending ? " and " : "", g_watchPending ? "watch" : "",
+    if (g_peekPending || g_watchPending || g_findPending)
+        Log::get().note("probe: %s%s%s at the next frame (image base %p).", g_peekPending ? "peek " : "",
+                        g_watchPending ? "watch " : "", g_findPending ? "find " : "",
                         reinterpret_cast<void*>(g_base));
 }
 
 void memProbeFrame() {
+    if (g_findRunning && g_findDone) EndFind();
+    if (g_findPending && !g_findRunning) {
+        g_findPending = false;
+        StartFind();
+    }
     if (!g_peekPending && !g_watchPending && !g_watching && !g_repeatMs) return;
     const ULONGLONG now = GetTickCount64();
     if (g_peekPending || (g_repeatMs && !g_peekText.empty() && now - g_lastPeekMs >= static_cast<ULONGLONG>(g_repeatMs))) {
