@@ -1610,6 +1610,9 @@ void StereoWriteFor(ID3D11DeviceContext* ctx, int pipe) {
         Rewrite(ctx, g_frameCb, g_b1Copy, g_b1CopyBytes, g_b1Edits, pipe);
         g_b1Pipe = pipe;
     }
+    // A draw kept at the game's camera reads b0 and b1 only (the stars'):
+    // the kept buffers stay with their eye, not rewritten twice around it.
+    if (pipe == kPipeCentre) return;
     for (int i = 0; i < g_trackedCount; ++i) {
         Tracked& t = g_tracked[i];
         if (t.pipe == pipe) continue;
