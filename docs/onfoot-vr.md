@@ -2,6 +2,57 @@
 
 ## Status
 
+State (2026-09-25): on foot is stereo VR with head-driven aim, usable in
+the field (Quest 3 over Virtual Desktop, game build 332.841). Branch
+`onfoot-vr`, experimental, every piece behind its own `experimental.` key.
+
+- Stereo (`onfoot_stereo`): the engine is kept in HMD stereo (display mode
+  3) instead of HMD Cinema (5) on foot, so both eye pipelines render; each
+  pipeline's camera writes are moved by half the IPD (b0/b1, and the
+  lighting's copies: the lights' V, V^-1 and P V, the shadow mask's
+  view-to-light translation). Each flat image is placed at the game's
+  frustum angles in its eye, and handed over with the head pose it was
+  drawn for (`onfoot_render_pose`).
+- Head drive (`onfoot_head_drive`): the head's pitch goes into the game's
+  own look and its yaw turns the body, so aim, culling and walking follow
+  the head; the head look turns the picture by what is left (roll, lag).
+  The player's look component is found by matching the drawn camera.
+- Head look (`onfoot_head_look`), ADS without the zoom (`onfoot_ads_zoom`
+  0), stars kept at infinity (`onfoot_stereo_centre_vs`).
+- Field-confirmed 2026-09-25: stereo; aim on the crosshair; stars at
+  infinity; shadows and shade alike in both eyes (the eye dump found the
+  mask); no one-frame jumps on a head yaw; board/disembark.
+
+Known issues (next):
+- Load-in: stereo sometimes does not engage, more often far from the ship
+  and always after a return to the main menu -- the engine then renders
+  the on-foot scene at the headset's eye size (2365x2423) instead of the
+  panel's, and nothing arms. The no-scene log line now carries the camera
+  seen; next flight decides whether to accept the eye-sized scene.
+- The head drive can take seconds to hold after a load-in (the game does
+  not follow the head at first; the drive stands aside and retries).
+- Lights pivot slightly with a head yaw after a board/disembark; a subtle
+  sun shading moves along a hull with the head.
+- Build-specific: the three code patches (display mode, look clamp, ADS
+  zoom) refuse any build but 332.841.
+
+Tested settings (`[experimental]`): onfoot_head_look = 1, onfoot_stereo = 1,
+stereo_mode_probe = 1, onfoot_head_drive = 1, onfoot_stereo_anchor = right,
+onfoot_hud_scale = 0.5, onfoot_match_fov = 1, onfoot_ads_zoom = 0,
+onfoot_render_pose = 1, onfoot_stereo_centre_vs =
+68dddef04d9894af,f7a6e916f14a3b1a.
+
+Developer instruments, all off by default: onfoot_camera_hunt, probe_peek /
+probe_watch / probe_find (memory probes: hardware watchpoints, a brief
+suspension of the game's threads to patch), stereo_mode_watch,
+onfoot_stereo_diag, onfoot_stereo_skip_vs, onfoot_head_look_skip, and the
+census key's on-foot capture with the per-eye image dump
+(tools/onfoot_eyes.py).
+
+Ruled out: see the journal below (each entry's "ruled out" lines).
+
+## 2026-09-23: milestones 1 and 2 (mono), the old status
+
 State (2026-09-23, late): milestones 1 and 2 work in the field, mono.
 
 - Head look (`experimental.onfoot_head_look`): the head turns the game's
@@ -104,3 +155,43 @@ fine. Ruled out, each by a flight with no visible change:
 Open: `outside` (build 496e49d) turns the view only while a panel-sized
 target is bound, for the hypothesis that the shadow-map and other offscreen
 passes cull casters with the main camera.
+
+## 2026-09-24/25: stereo, the head drive, the lighting's eye
+
+Stereo from the engine's own pipelines: the display-mode store patched 5 to
+3 on foot (stereo_mode_probe.cpp); each pipeline's camera writes moved by
+half the IPD along the turned right axis; the left eye told by the texture
+the game submits. Then, each by a field report and a fix:
+
+- Head drive (head_drive.cpp): a stub at the look's pitch clamp
+  (+0x1A9CB11) calls in on the game's thread; the head's pitch replaces the
+  stick's, its yaw turns the body rows (Y+0x5B0). The render side matches
+  the drawn camera to the game frame's head sample (records of yaw, camera
+  yaw, body rows) and turns by the residual only. Fixes on the way: the
+  stick's ground lead (Y+0x724) is a turn of the world, not the camera;
+  the player's component is picked by matching the drawn camera (NPCs run
+  the same update); a component whose records match is never refused; the
+  drive stands aside while the game does not follow the head (load-in).
+- The lighting's eye: the lights' constants (784/480-byte cb2, a per-frame
+  pool) hold the camera with its position -- V, V^-1, P V -- written once
+  per pass; moved per eye (and turned with the head). Buffers written once
+  for both eyes are kept and written again for the other eye.
+  ruled out: the four draws only the first pipeline composites (vs
+  41e245d4.., d95905c1.., d1281df4.., 5e417e9d..) as the shade difference,
+  because leaving them out changed nothing.
+- Shade differing between the eyes: the per-eye image dump (census key;
+  tools/onfoot_eyes.py pairs the pipelines' textures and lines them up by
+  depth) put the parting at the sun's shadow mask. Its bytecode rebuilds
+  the view position from linear depth and rows 1, 2, 4 (row 3 unread) and
+  goes to light space by rows 7-9 plus row 10: the eye is row 10 += offset
+  * row 7. The sun pass itself shades in view space and needs nothing.
+- Stars: the Milky Way is one draw per eye through its own galaxy-frame
+  block (left alone: e/near at the near plane smeared it); the star layer
+  (vs 68dddef04d9894af, f7a6e916f14a3b1a) is drawn from the game's own
+  camera in both eyes (onfoot_stereo_centre_vs).
+- One-frame jumps on a head yaw: a newer head pose is published before
+  every frame ends (up to 5.7 degrees apart on a fast yaw). The frame is
+  now handed over with the located views of the pose it was drawn for
+  (frame_flag onFootRenderPose, v38; the runtime keeps six located frames).
+  ruled out: turns made before the frame's camera is known, because in the
+  capture nothing turned early is read by a visible draw.

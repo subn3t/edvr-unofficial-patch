@@ -192,6 +192,20 @@ over planets. It is off by default because it costs GPU time, and turning it on
 takes three settings in `edvr.ini`, which
 [docs/fixes.md](docs/fixes.md#over-a-planet) walks through.
 
+## On-foot VR (experimental, `onfoot-vr` branch)
+
+On foot, Elite draws a flat screen floating in front of you. This branch
+turns it into stereo VR: the engine's own two eye pipelines render, each
+from its eye; your head looks around and aims (the game's own look is
+driven by the head, so shots, culling and walking follow it); stars stay
+at infinity, and lighting and shadows match in both eyes. It is
+experimental and off by default; every piece has its own
+`[experimental]` key in `edvr.ini`, and
+[docs/onfoot-vr.md](docs/onfoot-vr.md) lists the tested settings, the
+known issues (stereo sometimes does not engage at a load-in), and how
+each part works. It needs game build 332.841: its three patches to the
+game's code refuse any other build.
+
 ## Settings
 
 Everything is in `edvr.ini` next to the game, and if the file is missing you
@@ -258,6 +272,13 @@ No fix here touches the network, your account, or anything the server sees, and
 none reads or changes gameplay state (position, ship, cargo, credits,
 missions). None interacts with anti-cheat, and none attempts to hide from
 anything.
+
+The experimental on-foot VR (above, all off by default) goes further in
+three places, each named in its setting: it keeps the engine in its HMD
+stereo display mode on foot, removes the aim-down-sights zoom, and -- the
+head drive -- writes your character's look pitch and body heading from
+your head, as the stick would. Its developer probes (off unless set)
+can watch game memory with hardware watchpoints.
 
 ## Build
 
