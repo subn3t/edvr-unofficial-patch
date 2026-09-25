@@ -57,7 +57,8 @@ inline bool onFootLookEnabled() { return detail::g_onFootLookEnabled; }
 // leaves the draw to the game). Learns the buffers and the main projection at
 // the first panel-sized G-buffer draw of a frame; with the on-foot stereo,
 // writes the camera again for the eye whose targets this draw uses.
-void onFootLookBeforeDraw(ID3D11DeviceContext* ctx);
+// True: leave the draw out (experimental.onfoot_stereo_skip_vs).
+bool onFootLookBeforeDraw(ID3D11DeviceContext* ctx);
 
 // The context's real Map and Unmap (vscreen's, behind its own hooks): the
 // on-foot stereo's second write of a camera buffer goes through them, so the

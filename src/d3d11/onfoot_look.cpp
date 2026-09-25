@@ -730,7 +730,7 @@ bool InMainFrame(const float* b) {
 // inverse's position gains e, P V's x row loses sx * offset. (R the game's
 // camera, not turned by the head: the head's residual turn of the eye's axis
 // is a millimetre at most.)
-uint64_t g_basesMoved = 0, g_centreDraws = 0;
+uint64_t g_basesMoved = 0, g_centreDraws = 0, g_skippedDraws = 0;
 bool BasisEdits(const float* b, UINT at, EditList* out) {
     if (!out || out->n + 3 > kMaxEdits) return false;
     for (const bool byColumns : {false, true}) {
@@ -988,11 +988,11 @@ void Report() {
                         "all %d taken), %llu written again for the other eye; draws with no depth target of theirs "
                         "given an eye by the depth they read %llu, by their target %llu%s; %llu camera copies in "
                         "another world frame (the sky's) left; %llu of the lights' camera copies moved; %llu draws "
-                        "given the game's own camera (onfoot_stereo_centre_vs).",
+                        "given the game's own camera (onfoot_stereo_centre_vs), %llu left out (onfoot_stereo_skip_vs).",
                         U(g_invMoved), U(g_trackedCount), U(g_trackedFull), kMaxTracked, U(g_trackedRewrites),
                         U(g_pipeFromSrv), U(g_pipeFromRtv), Skipped(kPartEyeLight) ? " (part eyelight left out)" : "",
-                        U(g_invOtherFrame), U(g_basesMoved), U(g_centreDraws));
-    g_invOtherFrame = g_basesMoved = g_centreDraws = 0;
+                        U(g_invOtherFrame), U(g_basesMoved), U(g_centreDraws), U(g_skippedDraws));
+    g_invOtherFrame = g_basesMoved = g_centreDraws = g_skippedDraws = 0;
     g_invMoved = g_trackedFull = g_trackedRewrites = g_pipeFromSrv = g_pipeFromRtv = 0;
     g_moved =g_movedNear = g_rewrites = g_rewriteFails = g_notDiscard = g_newTargets = 0;
     g_lockWarpMaxDeg = 0;
@@ -1301,6 +1301,24 @@ int g_anchor = 0;
 constexpr int kPipeCentre = 2;
 uint64_t g_centreVs[16] = {};
 int g_centreVsCount = 0;
+// experimental.onfoot_stereo_skip_vs: draws by these vertex shaders left out
+// (a developer switch: which effect a difference between the eyes follows).
+uint64_t g_skipVs[16] = {};
+int g_skipVsCount = 0;
+
+int ParseHashes(const std::string& list, uint64_t out[16]) {
+    int count = 0;
+    for (size_t at = 0; at < list.size() && count < 16;) {
+        const size_t end = list.find(',', at);
+        const std::string item = list.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        char* stop = nullptr;
+        const uint64_t v = _strtoui64(item.c_str(), &stop, 16);
+        if (v) out[count++] = v;
+        if (end == std::string::npos) break;
+        at = end + 1;
+    }
+    return count;
+}
 
 
 double PipeOffset(int pipe) {
@@ -1845,22 +1863,20 @@ void onFootLookConfigure(Config& cfg) {
         Log::get().note("onfoot stereo: IPD %s.", ipd > 0 ? "from onfoot_stereo_ipd_mm" : (ipd == 0 ? "the headset's" : "none: the eyes are not moved"));
     g_ipdMm = ipd;
     const std::string centre = cfg.getString("experimental.onfoot_stereo_centre_vs", "");
-    int centreCount = 0;
     uint64_t centreVs[16] = {};
-    for (size_t at = 0; at < centre.size() && centreCount < 16;) {
-        const size_t end = centre.find(',', at);
-        const std::string item = centre.substr(at, end == std::string::npos ? std::string::npos : end - at);
-        char* stop = nullptr;
-        const uint64_t v = _strtoui64(item.c_str(), &stop, 16);
-        if (v) centreVs[centreCount++] = v;
-        if (end == std::string::npos) break;
-        at = end + 1;
-    }
+    const int centreCount = ParseHashes(centre, centreVs);
     if (centreCount != g_centreVsCount || memcmp(centreVs, g_centreVs, sizeof(centreVs)) != 0)
         Log::get().note("onfoot stereo: %d vertex shader(s) drawn from the game's own camera in both eyes (\"%s\").",
                         centreCount, centre.c_str());
     memcpy(g_centreVs, centreVs, sizeof(centreVs));
     g_centreVsCount = centreCount;
+    const std::string skipList = cfg.getString("experimental.onfoot_stereo_skip_vs", "");
+    uint64_t skipVs[16] = {};
+    const int skipCount = ParseHashes(skipList, skipVs);
+    if (skipCount != g_skipVsCount || memcmp(skipVs, g_skipVs, sizeof(skipVs)) != 0)
+        Log::get().note("onfoot stereo: %d vertex shader(s) left out (\"%s\").", skipCount, skipList.c_str());
+    memcpy(g_skipVs, skipVs, sizeof(skipVs));
+    g_skipVsCount = skipCount;
     const float nearEye = cfg.getFloat("experimental.onfoot_stereo_near_eye", 1.0f);
     const double nearClamped = nearEye < 0 ? 0.0 : (nearEye > 1 ? 1.0 : nearEye);
     if (nearClamped != g_nearEye)
@@ -1887,20 +1903,27 @@ void onFootLookSetMapFns(OnFootMapFn map, OnFootUnmapFn unmap) {
     g_realUnmap = unmap;
 }
 
-void onFootLookBeforeDraw(ID3D11DeviceContext* ctx) {
-    if (!detail::g_onFootLookEnabled) return;
+bool onFootLookBeforeDraw(ID3D11DeviceContext* ctx) {
+    if (!detail::g_onFootLookEnabled) return false;
     ++g_drawOrdinal;
     if (g_stereoDiag) DiagDraw();
     if (g_stereoOn && ctx) StereoDraw(ctx);
     if (g_capFile && ctx) CapDraw(ctx);
-    if (!PanelGBufferBound()) return;
+    bool skip = false;
+    if (g_stereoOn && g_skipVsCount) {
+        const uint64_t vs = bindingShaderHash(BindSlot::Vs);
+        for (int i = 0; i < g_skipVsCount; ++i) skip |= g_skipVs[i] == vs;
+        if (skip) ++g_skippedDraws;
+    }
+    if (!PanelGBufferBound()) return skip;
     if (g_viewRawFresh && bindingGet(BindSlot::VsCb0) == g_viewCb) {
         g_viewRawFresh = false;
         ConsiderMain(g_viewRaw);
     }
-    if (g_foundThisFrame) return;
+    if (g_foundThisFrame) return skip;
     g_foundThisFrame = true;
     Learn();
+    return skip;
 }
 
 void onFootLookMapped(ID3D11Resource* res, void* data, D3D11_MAP type) {
