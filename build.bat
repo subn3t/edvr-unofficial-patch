@@ -1733,14 +1733,11 @@ cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT /D_CRT_SECURE_NO_WARNINGS ^
     /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib
 if errorlevel 1 ( echo [edvr] ERROR: native runtime module test build failed & exit /b 1 )
 "%BUILD%\openxr_module_test.exe" --dry-run || exit /b 1
-REM LOCAL-ONLY (2026-09-25, onfoot-vr): these self-tests fail when no OpenXR
-REM runtime is up (Virtual Desktop streamer down), which blocked every build.
-REM Warn and continue here; REINSTATE "|| exit /b 1" before a fork or a PR.
-"%BUILD%\openxr_module_test.exe" --self-test || echo [edvr] WARNING: openxr_module_test --self-test failed -- continuing (LOCAL-ONLY, see REM above)
-"%BUILD%\openxr_module_test.exe" --self-test-bootstrap || echo [edvr] WARNING: openxr_module_test --self-test-bootstrap failed -- continuing (LOCAL-ONLY, see REM above)
-"%BUILD%\openxr_module_test.exe" --self-test-separate || echo [edvr] WARNING: openxr_module_test --self-test-separate failed -- continuing (LOCAL-ONLY, see REM above)
-"%BUILD%\openxr_module_test.exe" --self-test-bootstrap-separate || echo [edvr] WARNING: openxr_module_test --self-test-bootstrap-separate failed -- continuing (LOCAL-ONLY, see REM above)
-"%BUILD%\openxr_module_test.exe" --self-test-local || echo [edvr] WARNING: openxr_module_test --self-test-local failed -- continuing (LOCAL-ONLY, see REM above)
+"%BUILD%\openxr_module_test.exe" --self-test || exit /b 1
+"%BUILD%\openxr_module_test.exe" --self-test-bootstrap || exit /b 1
+"%BUILD%\openxr_module_test.exe" --self-test-separate || exit /b 1
+"%BUILD%\openxr_module_test.exe" --self-test-bootstrap-separate || exit /b 1
+"%BUILD%\openxr_module_test.exe" --self-test-local || exit /b 1
 exit /b 0
 
 :rig_installer
