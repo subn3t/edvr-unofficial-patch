@@ -525,7 +525,7 @@ int g_unmatchedRun = 0;
 uintptr_t g_seenPlayer = 0;
 std::atomic<bool> g_lost{false};
 
-bool headDriveCamera(const double axes[3][3], double qGame[3][3]) {
+bool headDriveCamera(const double axes[3][3], double qGame[3][3], bool early) {
     if (!g_installed || !g_want.load(std::memory_order_relaxed)) return false;
     const double* f = axes[2];
     uintptr_t player = g_player.load(std::memory_order_relaxed);
@@ -549,7 +549,7 @@ bool headDriveCamera(const double axes[3][3], double qGame[3][3]) {
         g_haveLastMatch = false;
     }
     if (!player) {
-        Seek(f);
+        if (!early) Seek(f);
         return false;
     }
     const LONG head = g_recordHead, floor = g_recordFloor;
@@ -572,6 +572,7 @@ bool headDriveCamera(const double axes[3][3], double qGame[3][3]) {
     // the last match's (its body's turn since is the error: a stick turn in
     // the gap); with none yet, no residual at all -- never the whole head
     // on top of a camera that already has it.
+    if (early && best < 0.9986) return false;
     if (best >= 0.9986) {
         g_matched.fetch_add(1, std::memory_order_relaxed);
         g_unmatchedRun = 0;
