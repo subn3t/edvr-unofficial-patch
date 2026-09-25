@@ -116,6 +116,7 @@ uint64_t g_driveEarly = 0, g_turnedBeforeDrive = 0;  // the report's
 // picture off by the head's turn between them for a frame (the ship's
 // one-frame jump on a head yaw, 2026-09-25, is the suspect).
 long g_poseSeqTaken = 0;
+bool g_renderPose = true;  // experimental.onfoot_render_pose
 uint64_t g_poseFrames = 0, g_poseStale = 0, g_poseStaleOver05 = 0;
 double g_poseStaleMaxDeg = 0, g_poseStaleSumDeg = 0;
 double g_hRender[3][3] = {};  // the same pose's rotation in OpenVR axes, for the head-locked view's timewarp
@@ -321,6 +322,7 @@ void TakeHeadRotation() {
     g_poseSeqTaken = headPoseSequence();
     g_qValid = headPose(m);
     if (!g_qValid) return;
+    if (g_renderPose) publishOnFootRenderPose(m);
     const double s[3] = {1, 1, -1};
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j) {
@@ -2169,6 +2171,11 @@ void onFootLookConfigure(Config& cfg) {
         Log::get().note("onfoot stereo: %d vertex shader(s) left out (\"%s\").", skipCount, skipList.c_str());
     memcpy(g_skipVs, skipVs, sizeof(skipVs));
     g_skipVsCount = skipCount;
+    const bool renderPose = cfg.getBool("experimental.onfoot_render_pose", true);
+    if (renderPose != g_renderPose)
+        Log::get().note("onfoot stereo: each frame handed over with %s.",
+                        renderPose ? "the head pose it was turned with" : "the frame's latest located pose");
+    g_renderPose = renderPose;
     const float nearEye = cfg.getFloat("experimental.onfoot_stereo_near_eye", 1.0f);
     const double nearClamped = nearEye < 0 ? 0.0 : (nearEye > 1 ? 1.0 : nearEye);
     if (nearClamped != g_nearEye)

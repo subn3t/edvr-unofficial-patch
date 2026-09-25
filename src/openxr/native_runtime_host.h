@@ -316,6 +316,12 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   CompositorPublication poses;uint64_t compositorGeneration=0;
   OpenVRCompositor compositorInterface{this};
   GeometryInput frameGeometry{};bool frameGeometryAvailable=false;
+  // The last located frames with the head pose each published (the floats
+  // headPose hands d3d11): the on-foot frame is submitted with the views of
+  // the pose it was turned with (frame_flag.h, onFootRenderPose).
+  struct PoseFrame {GeometryInput geometry{};float head[12]{};bool valid=false;};
+  PoseFrame poseRing[6]{};unsigned poseRingNext=0;
+  uint64_t reposedEyes=0,reposeSame=0,reposeMissing=0;
   XrResult lastCompositorResult=XR_SUCCESS;
   uint64_t compositorWaits=0,compositorSubmits=0,compositorHandoffs=0,validGamePoses=0;
   uint64_t poseFailures=0;
@@ -1160,6 +1166,13 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
           featureFrame.trimNasalDeg<=0&&featureFrame.trimVerticalDeg<=0));
     boundary.setGeometryReady(geometryValid);
     frameGeometry=located;frameGeometryAvailable=true;
+    {
+      GeometrySnapshot poseSnapshot{};
+      if(makeGeometrySnapshot(located,poseSnapshot)) {
+        auto& entry=poseRing[poseRingNext++%6];
+        entry.geometry=located;std::memcpy(entry.head,poseSnapshot.headToLocal.m,sizeof(entry.head));entry.valid=true;
+      }
+    }
     frameViews[0]=located.views[0];frameViews[1]=located.views[1];
     frameContentViews[0]=frameViews[0];frameContentViews[1]=frameViews[1];
     framePlacement[0]={};framePlacement[1]={};
@@ -1515,7 +1528,22 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     // actual projection for this frame: in the menu and the XR layer both,
     // or, where a trim has moved the two apart, in the menu and the
     // placement, which is the one that still describes those pixels.
-    frameViews[unsigned(eye)]=frameGeometry.views[unsigned(eye)];
+    const GeometryInput* poseGeometry=&frameGeometry;
+    {
+      float renderHead[12],flatX=0,flatY=0;
+      if(edvr::onFootFlat(&flatX,&flatY)&&edvr::onFootRenderPose(renderHead)) {
+        const PoseFrame* hit=nullptr;
+        for(const auto& entry:poseRing)
+          if(entry.valid&&std::memcmp(entry.head,renderHead,sizeof(renderHead))==0)hit=&entry;
+        if(!hit)++reposeMissing;
+        else if(hit->geometry.sequence!=frameGeometry.sequence){poseGeometry=&hit->geometry;++reposedEyes;}
+        else ++reposeSame;
+        if(((reposedEyes+reposeSame+reposeMissing)%900)==0)
+          nativeTracePrintf("onfoot_render_pose,reposed=%llu,same=%llu,missing=%llu\n",
+            (unsigned long long)reposedEyes,(unsigned long long)reposeSame,(unsigned long long)reposeMissing);
+      }
+    }
+    frameViews[unsigned(eye)]=poseGeometry->views[unsigned(eye)];
     frameContentViews[unsigned(eye)]=frameViews[unsigned(eye)];
     framePlacement[unsigned(eye)]={};
     // A trim narrows what the image holds without narrowing what the layer

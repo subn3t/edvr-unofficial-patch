@@ -230,6 +230,11 @@ struct Shared {
     volatile LONG     onFootFlatTan[2];
     volatile LONG64   gameSubmitTex[2];
     volatile LONG     eyeSeparation;
+    // onFootPose      d3d11 -> openvr: the head pose (headPose's layout) the
+    //                 on-foot frame was turned with; onFootPoseSeq odd while
+    //                 written.
+    volatile LONG     onFootPoseSeq;
+    float             onFootPoseM[12];
 };
 
 // Per PROCESS, not per logon session.
@@ -601,6 +606,26 @@ void setOnFootFlat(bool on, float tanX, float tanY) {
         InterlockedExchange(&s->onFootFlatTan[1], FloatBits(tanY));
     }
     InterlockedExchange(&s->onFootFlat, on ? 1 : 0);
+}
+
+void publishOnFootRenderPose(const float* m12) {
+    Shared* s = map();
+    if (!s || !m12) return;
+    InterlockedIncrement(&s->onFootPoseSeq);
+    for (int i = 0; i < 12; ++i) s->onFootPoseM[i] = m12[i];
+    InterlockedIncrement(&s->onFootPoseSeq);
+}
+
+bool onFootRenderPose(float* out12) {
+    Shared* s = map();
+    if (!s || !out12) return false;
+    for (int tries = 0; tries < 4; ++tries) {
+        const LONG a = s->onFootPoseSeq;
+        if (a == 0 || (a & 1)) continue;
+        for (int i = 0; i < 12; ++i) out12[i] = s->onFootPoseM[i];
+        if (s->onFootPoseSeq == a) return true;
+    }
+    return false;
 }
 
 bool onFootFlat(float* tanX, float* tanY) {

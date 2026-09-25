@@ -195,6 +195,14 @@ bool eyeSwap();
 void setOnFootFlat(bool on, float tanX, float tanY);
 bool onFootFlat(float* tanX, float* tanY);
 
+// THE ON-FOOT RENDER POSE. d3d11 publishes the head pose (headPose's layout,
+// the very floats it read) each on-foot frame is turned with; at that frame's
+// submit the openvr half hands the compositor the located views that pose
+// came from, not the frame's latest (a newer pose is published before most
+// frames end: the picture would be placed for a head it was not drawn for).
+void publishOnFootRenderPose(const float* m12);
+bool onFootRenderPose(float* out12);
+
 // The texture the game passed to Submit for each eye (0 left, 1 right), a raw
 // ID3D11Texture2D pointer valid within this process, before any EDVR swap:
 // d3d11 matches it against the eye pipelines' targets to learn which one
