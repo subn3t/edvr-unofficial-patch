@@ -155,4 +155,49 @@ __declspec(noinline) uint32_t unwindGameStack(const CONTEXT& start, uintptr_t ba
     return found;
 }
 
+__declspec(noinline) uint32_t unwindGameFrames(const CONTEXT& start, uintptr_t base, uint64_t size, GameFrame* out,
+                                               uint32_t cap) noexcept {
+    CONTEXT c = start;
+    uint32_t found = 0;
+    const auto note = [&](const CONTEXT& k) {
+        if (found >= cap || k.Rip < base || k.Rip >= base + size) return;
+        out[found++] = GameFrame{static_cast<uint32_t>(k.Rip - base), k.Rbx, k.Rbp, k.Rsi, k.Rdi,
+                                 k.R12, k.R13, k.R14, k.R15};
+    };
+    note(c);
+    for (uint32_t step = 0; step < 40 && found < cap; ++step) {
+        if (!c.Rip) break;
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION function = nullptr;
+        __try {
+            function = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
+        const DWORD64 oldRip = c.Rip, oldRsp = c.Rsp;
+        if (function) {
+            DWORD64 establisher = 0;
+            PVOID handlerData = nullptr;
+            __try {
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, function, &c, &handlerData, &establisher,
+                                 nullptr);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                break;
+            }
+        } else {
+            uintptr_t next = 0;
+            __try {
+                next = *reinterpret_cast<const uintptr_t*>(c.Rsp);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                break;
+            }
+            c.Rip = next;
+            c.Rsp += sizeof(uintptr_t);
+        }
+        if (c.Rsp <= oldRsp || c.Rip == oldRip) break;
+        note(c);
+    }
+    return found;
+}
+
 }  // namespace edvr
