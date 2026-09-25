@@ -1,0 +1,460 @@
+#include "head_drive.h"
+
+#include <windows.h>
+#include <tlhelp32.h>
+
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+
+#include "../common/config.h"
+#include "../common/frame_flag.h"
+#include "../common/log.h"
+
+namespace edvr {
+
+namespace {
+
+// Build 332841 (stereo_mode_probe.cpp's identity pair).
+constexpr uint32_t kExpectedTimestamp = 1788384820u;
+constexpr uint32_t kExpectedImageSize = 104894464u;
+constexpr uintptr_t kClampRva = 0x1A9CB11u;
+constexpr uint8_t kClampBytes[30] = {0x41, 0x0F, 0x2F, 0xC0,                          // comiss xmm0,xmm8
+                                     0x77, 0x08,                                      // ja +8
+                                     0x0F, 0x28, 0xC6,                                // movaps xmm0,xmm6
+                                     0xF3, 0x41, 0x0F, 0x5D, 0xC0,                    // minss xmm0,xmm8
+                                     0xF3, 0x0F, 0x11, 0x87, 0x1C, 0x07, 0x00, 0x00,  // movss [rdi+71Ch],xmm0
+                                     0xF3, 0x0F, 0x11, 0x87, 0x18, 0x07, 0x00, 0x00};  // movss [rdi+718h],xmm0
+constexpr uintptr_t kBodyRows = 0x5B0;  // right, up, forward (float4 rows)
+
+uintptr_t g_base = 0;
+bool g_tried = false, g_installed = false;
+std::atomic<bool> g_want{false};
+volatile uint8_t* g_flag = nullptr;  // the stub's gate, in the stub's page
+
+// --- the game thread's side --------------------------------------------------
+
+std::atomic<uintptr_t> g_player{0};
+ULONGLONG g_playerMs = 0;
+double g_yawUsed = 0;
+bool g_haveYaw = false;
+std::atomic<uint64_t> g_driven{0}, g_others{0}, g_noPose{0}, g_adopted{0};
+
+// A game frame's record: the head yaw it applied and the body frame it left.
+struct Record {
+    volatile LONG seq;  // odd while written
+    float yaw;
+    float right[3], up[3], fwd[3];
+};
+constexpr int kRecords = 32;
+Record g_records[kRecords];
+volatile LONG g_recordHead = 0;
+
+__declspec(noinline) bool SehRead(uintptr_t at, void* out, size_t n) noexcept {
+    __try {
+        std::memcpy(out, reinterpret_cast<const void*>(at), n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+__declspec(noinline) bool SehWrite(uintptr_t at, const void* in, size_t n) noexcept {
+    __try {
+        std::memcpy(reinterpret_cast<void*>(at), in, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void Push(float yaw, const float* rows) {
+    const LONG i = InterlockedIncrement(&g_recordHead) - 1;
+    Record& r = g_records[i % kRecords];
+    InterlockedIncrement(&r.seq);  // odd: being written
+    r.yaw = yaw;
+    for (int k = 0; k < 3; ++k) {
+        r.right[k] = rows[k];
+        r.up[k] = rows[4 + k];
+        r.fwd[k] = rows[8 + k];
+    }
+    InterlockedIncrement(&r.seq);
+}
+
+double Wrap(double a) {
+    constexpr double kPi = 3.14159265358979323846;
+    while (a > kPi) a -= 2 * kPi;
+    while (a < -kPi) a += 2 * kPi;
+    return a;
+}
+
+// The head's yaw and pitch in the head look's form (onfoot_look.cpp's
+// TakeHeadRotation: Q = C R C, C = diag(1, 1, -1); yaw atan2(q02, q22),
+// pitch asin(-q12), positive down). False for no pose or a torn read.
+bool HeadYawPitch(double* yaw, double* pitch) {
+    float m[12];
+    if (!headPose(m)) return false;
+    for (int i = 0; i < 3; ++i) {
+        const double l = double(m[4 * i]) * m[4 * i] + double(m[4 * i + 1]) * m[4 * i + 1] +
+                         double(m[4 * i + 2]) * m[4 * i + 2];
+        if (std::fabs(l - 1) > 1e-3) return false;
+    }
+    // q[i][j] = m[i][j] s[i] s[j], s = (1, 1, -1).
+    const double q02 = -double(m[2]), q22 = m[10], q12 = -double(m[6]);
+    *yaw = std::atan2(q02, q22);
+    *pitch = std::asin(std::fmax(-1.0, std::fmin(1.0, -q12)));
+    return true;
+}
+
+// Called by the stub on the game's thread, once a frame per look component
+// that runs the input update, with rdi (the component) and the candidate
+// pitch (in: the stick's; out: the head's). True: use *pitch.
+bool GameHook(uintptr_t y, float* pitch) noexcept {
+    if (!g_want.load(std::memory_order_relaxed)) return false;
+    const ULONGLONG now = GetTickCount64();
+    const uintptr_t player = g_player.load(std::memory_order_relaxed);
+    if (y != player) {
+        // Another component: the player's once the last one has been quiet
+        // for half a second (a new session, a new body), else not ours.
+        if (player && now - g_playerMs < 500) {
+            g_others.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        g_player.store(y, std::memory_order_relaxed);
+        g_adopted.fetch_add(1, std::memory_order_relaxed);
+        g_haveYaw = false;
+    }
+    if (now - g_playerMs > 500) g_haveYaw = false;  // back after a pause: no turn for the gap
+    g_playerMs = now;
+    double yaw = 0, headPitch = 0;
+    if (!HeadYawPitch(&yaw, &headPitch)) {
+        g_noPose.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    float rows[12];
+    if (!SehRead(y + kBodyRows, rows, sizeof(rows))) return false;
+    // The last frame's record: the yaw it applied, the frame it left.
+    if (g_haveYaw) Push(static_cast<float>(g_yawUsed), rows);
+    // The body turned by the head's yaw since, about its up row.
+    const double d = g_haveYaw ? Wrap(yaw - g_yawUsed) : 0.0;
+    if (d != 0.0) {
+        const double c = std::cos(d), s = std::sin(d);
+        float turned[12];
+        std::memcpy(turned, rows, sizeof(turned));
+        for (int k = 0; k < 3; ++k) {
+            turned[k] = static_cast<float>(rows[k] * c - rows[8 + k] * s);      // right
+            turned[8 + k] = static_cast<float>(rows[8 + k] * c + rows[k] * s);  // forward
+        }
+        SehWrite(y + kBodyRows, turned, 12);
+        SehWrite(y + kBodyRows + 32, turned + 8, 12);
+    }
+    g_yawUsed = yaw;
+    g_haveYaw = true;
+    *pitch = static_cast<float>(headPitch);
+    g_driven.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// --- installing -------------------------------------------------------------
+
+__declspec(noinline) const char* CheckTarget(uintptr_t base) noexcept {
+    __try {
+        uint32_t peOff = 0, timestamp = 0, imageSize = 0;
+        std::memcpy(&peOff, reinterpret_cast<const void*>(base + 0x3C), 4);
+        if (peOff > 0x1000) return "PE header offset implausible";
+        std::memcpy(&timestamp, reinterpret_cast<const void*>(base + peOff + 8), 4);
+        std::memcpy(&imageSize, reinterpret_cast<const void*>(base + peOff + 0x50), 4);
+        if (timestamp != kExpectedTimestamp || imageSize != kExpectedImageSize)
+            return "not build 332841 (PE timestamp/size mismatch)";
+        const uint8_t* site = reinterpret_cast<const uint8_t*>(base + kClampRva);
+        if (std::memcmp(site, kClampBytes, sizeof(kClampBytes)) != 0)
+            return "the pitch clamp's bytes are not the expected ones";
+        if (site[-1] != 0x00 || site[6] != 0x0F) return "the bytes around the pitch clamp are not the expected ones";
+        return nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return "a read faulted while checking the executable";
+    }
+}
+
+uint8_t* AllocateNear(uintptr_t target) noexcept {
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const uintptr_t granularity = info.dwAllocationGranularity;
+    const uintptr_t floor = reinterpret_cast<uintptr_t>(info.lpMinimumApplicationAddress);
+    const uintptr_t ceiling = reinterpret_cast<uintptr_t>(info.lpMaximumApplicationAddress);
+    const uintptr_t distance = uintptr_t(INT32_MAX) - 0x10000u;
+    uintptr_t at = target > distance ? target - distance : floor;
+    if (at < floor) at = floor;
+    const uintptr_t limit = target > ceiling - distance ? ceiling : target + distance;
+    while (at < limit) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof(region))) break;
+        const uintptr_t start = reinterpret_cast<uintptr_t>(region.BaseAddress);
+        if (region.RegionSize > UINTPTR_MAX - start) break;
+        const uintptr_t end = start + region.RegionSize;
+        if (region.State == MEM_FREE) {
+            uintptr_t candidate = at > start ? at : start;
+            if (candidate > UINTPTR_MAX - (granularity - 1)) break;
+            candidate = (candidate + granularity - 1) & ~(granularity - 1);
+            if (candidate < limit && candidate < end && end - candidate >= 4096) {
+                auto* p = static_cast<uint8_t*>(
+                    VirtualAlloc(reinterpret_cast<void*>(candidate), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+                if (p) return p;
+            }
+        }
+        if (end <= at) break;
+        at = end;
+    }
+    return nullptr;
+}
+
+// One aligned 8-byte store into the game's code with every other thread
+// stopped, none of them inside (lo, hi) -- where the old instructions'
+// boundaries no longer are. Retries a few times. Nothing that could take a
+// lock runs while they are stopped.
+bool PatchStopped(uintptr_t q, int64_t value, uintptr_t lo, uintptr_t hi) {
+    constexpr int kMaxThreads = 1024;
+    static HANDLE threads[kMaxThreads];
+    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        int n = 0;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) return false;
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID != pid || te.th32ThreadID == self || n >= kMaxThreads) continue;
+                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+                if (!h) continue;
+                if (SuspendThread(h) == static_cast<DWORD>(-1)) {
+                    CloseHandle(h);
+                    continue;
+                }
+                threads[n++] = h;
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+        bool clear = true;
+        for (int i = 0; i < n && clear; ++i) {
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_CONTROL;
+            if (GetThreadContext(threads[i], &ctx) && ctx.Rip > lo && ctx.Rip < hi) clear = false;
+        }
+        bool done = false;
+        if (clear) {
+            DWORD old = 0;
+            if (VirtualProtect(reinterpret_cast<void*>(q), 8, PAGE_EXECUTE_READWRITE, &old)) {
+                InterlockedExchange64(reinterpret_cast<volatile LONG64*>(q), value);
+                DWORD ignored = 0;
+                VirtualProtect(reinterpret_cast<void*>(q), 8, old, &ignored);
+                FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(q), 8);
+                done = true;
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            ResumeThread(threads[i]);
+            CloseHandle(threads[i]);
+        }
+        if (done) return true;
+        if (!clear) {
+            Sleep(2);
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+void Install() {
+    g_tried = true;
+    if (!g_base) g_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if (const char* why = CheckTarget(g_base)) {
+        Log::get().note("onfoot head drive: not installed: %s.", why);
+        return;
+    }
+    const uintptr_t site = g_base + kClampRva;
+    uint8_t* stub = AllocateNear(site);
+    if (!stub) {
+        Log::get().note("onfoot head drive: not installed: no memory near the game's code.");
+        return;
+    }
+    const uintptr_t st = reinterpret_cast<uintptr_t>(stub);
+    uint8_t* flag = stub + 0x100;
+    // Gate; save the volatile registers; GameHook(rdi, &xmm8's slot); xmm8
+    // from the slot when it says so; restore; then the replaced comiss/ja,
+    // back into the game's code. rsp is 16-aligned at the site (a call just
+    // returned there): 7 pushes and 0x88 keep it aligned for the call.
+    uint8_t code[0xAB] = {
+        0x80, 0x3D, 0, 0, 0, 0, 0x00,                    // 00 cmp byte ptr [rip+flag],0
+        0x0F, 0x84, 0x8F, 0x00, 0x00, 0x00,              // 07 je 9C
+        0x50, 0x51, 0x52,                                // 0D push rax, rcx, rdx
+        0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,  // 10 push r8..r11
+        0x48, 0x81, 0xEC, 0x88, 0x00, 0x00, 0x00,        // 18 sub rsp,88h
+        0x0F, 0x11, 0x44, 0x24, 0x20,                    // 1F movups [rsp+20h],xmm0
+        0x0F, 0x11, 0x4C, 0x24, 0x30,                    // 24 movups [rsp+30h],xmm1
+        0x0F, 0x11, 0x54, 0x24, 0x40,                    // 29 movups [rsp+40h],xmm2
+        0x0F, 0x11, 0x5C, 0x24, 0x50,                    // 2E movups [rsp+50h],xmm3
+        0x0F, 0x11, 0x64, 0x24, 0x60,                    // 33 movups [rsp+60h],xmm4
+        0x0F, 0x11, 0x6C, 0x24, 0x70,                    // 38 movups [rsp+70h],xmm5
+        0xF3, 0x44, 0x0F, 0x11, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00,  // 3D movss [rsp+80h],xmm8
+        0x48, 0x89, 0xF9,                                            // 47 mov rcx,rdi
+        0x48, 0x8D, 0x94, 0x24, 0x80, 0x00, 0x00, 0x00,              // 4A lea rdx,[rsp+80h]
+        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,                          // 52 mov rax,GameHook
+        0xFF, 0xD0,                                                  // 5C call rax
+        0x84, 0xC0,                                                  // 5E test al,al
+        0x74, 0x0A,                                                  // 60 je 6C
+        0xF3, 0x44, 0x0F, 0x10, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00,  // 62 movss xmm8,[rsp+80h]
+        0x0F, 0x10, 0x44, 0x24, 0x20,                                // 6C movups xmm0,[rsp+20h]
+        0x0F, 0x10, 0x4C, 0x24, 0x30,                                // 71 movups xmm1,[rsp+30h]
+        0x0F, 0x10, 0x54, 0x24, 0x40,                                // 76 movups xmm2,[rsp+40h]
+        0x0F, 0x10, 0x5C, 0x24, 0x50,                                // 7B movups xmm3,[rsp+50h]
+        0x0F, 0x10, 0x64, 0x24, 0x60,                                // 80 movups xmm4,[rsp+60h]
+        0x0F, 0x10, 0x6C, 0x24, 0x70,                                // 85 movups xmm5,[rsp+70h]
+        0x48, 0x81, 0xC4, 0x88, 0x00, 0x00, 0x00,                    // 8A add rsp,88h
+        0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58,              // 91 pop r11..r8
+        0x5A, 0x59, 0x58,                                            // 99 pop rdx, rcx, rax
+        0x41, 0x0F, 0x2F, 0xC0,                                      // 9C comiss xmm0,xmm8
+        0x0F, 0x87, 0, 0, 0, 0,                                      // A0 ja site+0Eh
+        0xE9, 0, 0, 0, 0};                                           // A6 jmp site+06h
+    auto rel = [](uintptr_t to, uintptr_t next) {
+        return static_cast<int32_t>(static_cast<intptr_t>(to) - static_cast<intptr_t>(next));
+    };
+    const int32_t flagDisp = rel(reinterpret_cast<uintptr_t>(flag), st + 0x07);
+    const uint64_t hook = reinterpret_cast<uint64_t>(&GameHook);
+    const int32_t jaDisp = rel(site + 0x0E, st + 0xA6);
+    const int32_t backDisp = rel(site + 0x06, st + 0xAB);
+    std::memcpy(code + 0x02, &flagDisp, 4);
+    std::memcpy(code + 0x54, &hook, 8);
+    std::memcpy(code + 0xA2, &jaDisp, 4);
+    std::memcpy(code + 0xA7, &backDisp, 4);
+    std::memcpy(stub, code, sizeof(code));
+    *flag = g_want.load() ? 1 : 0;
+    DWORD old = 0;
+    if (!VirtualProtect(stub, 4096, PAGE_EXECUTE_READWRITE, &old) ||
+        !FlushInstructionCache(GetCurrentProcess(), stub, sizeof(code))) {
+        Log::get().note("onfoot head drive: not installed: the stub could not be made executable.");
+        return;
+    }
+    g_flag = flag;
+    // The site as one aligned 8-byte store: +0x1A9CB10 keeps its byte (the
+    // call's last), E9 rel32 over the comiss, a NOP over the ja's second
+    // byte, +0x1A9CB17 (movaps) untouched -- with no thread stopped at the
+    // ja (+0x1A9CB15), the one boundary that moves.
+    const uintptr_t q = site - 1;
+    if (q % 8 != 0) {
+        Log::get().note("onfoot head drive: not installed: the site is not where an atomic store can cover it.");
+        return;
+    }
+    uint8_t bytes[8];
+    std::memcpy(bytes, reinterpret_cast<const void*>(q), 8);
+    const int32_t toStub = rel(st, site + 5);
+    bytes[1] = 0xE9;
+    std::memcpy(bytes + 2, &toStub, 4);
+    bytes[6] = 0x90;
+    int64_t value;
+    std::memcpy(&value, bytes, 8);
+    if (!PatchStopped(q, value, site, site + 6)) {
+        Log::get().note("onfoot head drive: not installed: the game's code could not be patched.");
+        return;
+    }
+    g_installed = true;
+    Log::get().note("onfoot head drive: installed at the look's pitch clamp (+0x%llX): the head's pitch goes into "
+                    "the game's look, its yaw turns the body.",
+                    static_cast<unsigned long long>(kClampRva));
+}
+
+// --- the render side --------------------------------------------------------
+
+std::atomic<uint64_t> g_matched{0}, g_unmatched{0};
+double g_residualSum = 0;
+uint64_t g_residualCount = 0;
+double g_residualMax = 0;
+ULONGLONG g_reportMs = 0;
+
+}  // namespace
+
+void headDriveConfigure(Config& cfg) {
+    const bool want = cfg.getBool("experimental.onfoot_head_drive", false);
+    if (want != g_want.load())
+        Log::get().note(want ? "onfoot head drive: ON (live): the head moves the game's own look."
+                             : "onfoot head drive: off (live): the stick has the look again.");
+    g_want.store(want);
+    if (want && !g_tried) Install();
+    if (g_flag) *g_flag = want ? 1 : 0;
+}
+
+bool headDriveCamera(const double axes[3][3], double qGame[3][3]) {
+    if (!g_installed || !g_want.load(std::memory_order_relaxed)) return false;
+    const double* f = axes[2];
+    const LONG head = g_recordHead;
+    double best = -2, bestYaw = 0, bestDelta = 0, bestUp[3] = {};
+    for (int k = 0; k < kRecords && k < head; ++k) {
+        const Record& r = g_records[(head - 1 - k) % kRecords];
+        const LONG s0 = r.seq;
+        if (s0 & 1) continue;
+        Record c;
+        std::memcpy(&c, &r, sizeof(c));
+        if (r.seq != s0) continue;
+        const double up[3] = {c.up[0], c.up[1], c.up[2]};
+        const double fu = f[0] * up[0] + f[1] * up[1] + f[2] * up[2];
+        double h[3] = {f[0] - fu * up[0], f[1] - fu * up[1], f[2] - fu * up[2]};
+        const double hl = std::sqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+        if (hl < 1e-3) continue;
+        for (double& v : h) v /= hl;
+        const double cf = h[0] * c.fwd[0] + h[1] * c.fwd[1] + h[2] * c.fwd[2];
+        if (cf > best) {
+            best = cf;
+            bestYaw = c.yaw;
+            bestDelta = std::atan2(h[0] * c.right[0] + h[1] * c.right[1] + h[2] * c.right[2], cf);
+            for (int i = 0; i < 3; ++i) bestUp[i] = up[i];
+        }
+    }
+    // Within 10 degrees of a frame's body: that frame's head sample.
+    if (best < 0.985) {
+        g_unmatched.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    g_matched.fetch_add(1, std::memory_order_relaxed);
+    const double psi = bestYaw + bestDelta;
+    const double fu = f[0] * bestUp[0] + f[1] * bestUp[1] + f[2] * bestUp[2];
+    const double b = -std::asin(std::fmax(-1.0, std::fmin(1.0, fu)));  // positive down
+    // Ry(psi) Rx(b).
+    const double cy = std::cos(psi), sy = std::sin(psi), cb = std::cos(b), sb = std::sin(b);
+    const double ry[3][3] = {{cy, 0, sy}, {0, 1, 0}, {-sy, 0, cy}};
+    const double rx[3][3] = {{1, 0, 0}, {0, cb, -sb}, {0, sb, cb}};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) qGame[i][j] = ry[i][0] * rx[0][j] + ry[i][1] * rx[1][j] + ry[i][2] * rx[2][j];
+    return true;
+}
+
+void headDriveNoteResidual(double degrees) {
+    g_residualSum += degrees;
+    ++g_residualCount;
+    if (degrees > g_residualMax) g_residualMax = degrees;
+}
+
+void headDriveFrame() {
+    if (!g_installed) return;
+    const ULONGLONG now = GetTickCount64();
+    if (!g_reportMs) g_reportMs = now;
+    if (now - g_reportMs < 10000) return;
+    g_reportMs = now;
+    const uint64_t driven = g_driven.exchange(0), others = g_others.exchange(0), noPose = g_noPose.exchange(0);
+    const uint64_t matched = g_matched.exchange(0), unmatched = g_unmatched.exchange(0);
+    if (!driven && !matched && !unmatched && !others) return;
+    Log::get().note("onfoot head drive: last 10 s %llu game frames driven (component %p, %llu adopted; %llu calls "
+                    "from other components, %llu without a head pose); drawn frames matched to their head sample "
+                    "%llu, unmatched %llu; residual turn mean %.2f max %.2f degrees.",
+                    static_cast<unsigned long long>(driven), reinterpret_cast<void*>(g_player.load()),
+                    static_cast<unsigned long long>(g_adopted.load()), static_cast<unsigned long long>(others),
+                    static_cast<unsigned long long>(noPose), static_cast<unsigned long long>(matched),
+                    static_cast<unsigned long long>(unmatched),
+                    g_residualCount ? g_residualSum / double(g_residualCount) : 0.0, g_residualMax);
+    g_residualSum = 0;
+    g_residualCount = 0;
+    g_residualMax = 0;
+}
+
+}  // namespace edvr

@@ -15,6 +15,7 @@
 #include "binding_shadow.h"
 #include "camera_hunt.h"
 #include "draw_census.h"
+#include "head_drive.h"
 #include "journal_watch.h"
 #include "mem_probe.h"
 #include "stereo_mode_probe.h"
@@ -98,9 +99,16 @@ bool g_rtvIsAnyGBuffer = false;  // the diagnostic's: any R10G10B10A2 target wit
 // "on foot but no panel scene" line reports, so a size mismatch is visible.
 uint32_t g_lastGbufW = 0, g_lastGbufH = 0;
 
-// The head rotation for this frame's writes, in the game's view axes, taken
-// once per frame at the first turn.
+// The rotation this frame's writes are turned by, in the game's view axes:
+// the head's, taken once per frame at the first turn -- or, with the head
+// driving the game's look (head_drive.h), what is left of it once the game's
+// camera has turned: Q = G^T H, G the drawn camera as the head sample the
+// game applied (known at the frame's first main view; the frame's earlier
+// writes get the last frame's G).
 double g_q[3][3] = {};
+double g_qHead[3][3] = {};
+double g_qGame[3][3] = {};
+bool g_haveQGame = false, g_driveTaken = false;
 double g_hRender[3][3] = {};  // the same pose's rotation in OpenVR axes, for the head-locked view's timewarp
 bool g_qValid = false, g_qTaken = false;
 
@@ -251,6 +259,16 @@ bool IsMainView(const float* rows) {
            Near(RowLength(rows + 4), g_mainScale[1], kTolerance * g_mainScale[1]);
 }
 
+// g_q from the head's rotation and, when the head drives the game, the
+// game's camera: Q = G^T H.
+void ComposeQ() {
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            g_q[i][j] = !g_haveQGame ? g_qHead[i][j]
+                                     : g_qGame[0][i] * g_qHead[0][j] + g_qGame[1][i] * g_qHead[1][j] +
+                                           g_qGame[2][i] * g_qHead[2][j];
+}
+
 // The head's rotation in the game's view axes. headPose is OpenVR's: x right,
 // y up, z back; the game's view is x right, y up, z forward (the clip
 // transform's w row is the unit forward vector). Q = C R C, C = diag(1,1,-1).
@@ -263,14 +281,36 @@ void TakeHeadRotation() {
     const double s[3] = {1, 1, -1};
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j) {
-            g_q[i][j] = double(m[4 * i + j]) * s[i] * s[j];
+            g_qHead[i][j] = double(m[4 * i + j]) * s[i] * s[j];
             g_hRender[i][j] = m[4 * i + j];
         }
     // For the report: yaw about y, pitch about x, roll about z (degrees).
     const double kDeg = 57.29577951308232;
-    g_lastYaw = std::atan2(g_q[0][2], g_q[2][2]) * kDeg;
-    g_lastPitch = std::asin(std::fmax(-1.0, std::fmin(1.0, -g_q[1][2]))) * kDeg;
-    g_lastRoll = std::atan2(g_q[1][0], g_q[1][1]) * kDeg;
+    g_lastYaw = std::atan2(g_qHead[0][2], g_qHead[2][2]) * kDeg;
+    g_lastPitch = std::asin(std::fmax(-1.0, std::fmin(1.0, -g_qHead[1][2]))) * kDeg;
+    g_lastRoll = std::atan2(g_qHead[1][0], g_qHead[1][1]) * kDeg;
+    ComposeQ();
+}
+
+// The frame's first main view, before it turns: which head sample the game
+// built this camera from, when the head drives it.
+void DriveFromRows(const float* rows) {
+    if (g_driveTaken) return;
+    g_driveTaken = true;
+    const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
+    if (sx < 1e-6 || sy < 1e-6 || sw < 1e-6) return;
+    double axes[3][3];
+    for (int k = 0; k < 3; ++k) {
+        axes[0][k] = rows[k] / sx;
+        axes[1][k] = rows[4 + k] / sy;
+        axes[2][k] = rows[12 + k] / sw;
+    }
+    g_haveQGame = headDriveCamera(axes, g_qGame);
+    ComposeQ();
+    if (g_haveQGame) {
+        const double c = std::fmax(-1.0, std::fmin(1.0, (g_q[0][0] + g_q[1][1] + g_q[2][2] - 1) / 2));
+        headDriveNoteResidual(std::acos(c) * 57.29577951308232);
+    }
 }
 
 // Only on foot, with a centred main view. With the on-foot stereo the ship,
@@ -430,7 +470,9 @@ void TurnView(float* a) {
         if (!turned && !matched) ++g_otherViews;
         return;
     }
-    if (Skipped(kPartView) || !Armed() || !RotateRows(a)) return;
+    if (Skipped(kPartView) || !Armed()) return;
+    DriveFromRows(a);
+    if (!RotateRows(a)) return;
     ++g_turnedView;
     if (!g_loggedFirst) {
         g_loggedFirst = true;
@@ -474,7 +516,9 @@ bool TurnClip(float* c) {
         return false;
     }
     TakeFrameRotation(rows);
-    if (Skipped(kPartView) || !Armed() || !RotateRows(rows)) return true;
+    if (Skipped(kPartView) || !Armed()) return true;
+    DriveFromRows(rows);
+    if (!RotateRows(rows)) return true;
     for (int r = 0; r < 4; ++r)
         for (int col = 0; col < 4; ++col) c[4 * col + r] = rows[4 * r + col];
     ++g_turnedClip;
@@ -1374,6 +1418,7 @@ void onFootLookConfigure(Config& cfg) {
     g_matchFov = match;
     cameraHuntConfigure(cfg);
     memProbeConfigure(cfg);
+    headDriveConfigure(cfg);
     const std::string skip = cfg.getString("experimental.onfoot_head_look_skip", "");
     unsigned mask = 0;
     const struct {
@@ -1536,6 +1581,8 @@ void onFootLookStateCleared() {
 
 void onFootLookFrameBoundary() {
     memProbeFrame();
+    headDriveFrame();
+    g_driveTaken = false;
     if (!detail::g_onFootLookEnabled) return;
     ++g_frames;
     if (g_stereoDiag) DiagFrame();
