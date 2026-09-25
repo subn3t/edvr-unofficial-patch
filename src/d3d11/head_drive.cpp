@@ -48,7 +48,7 @@ std::atomic<ULONGLONG> g_drivenMs{0};  // the last game frame the head drove
 // Y+0x734, the recoil's; positive right, as the look's vfC8 applies it).
 struct Record {
     volatile LONG seq;  // odd while written
-    float yaw, camYaw;
+    float yaw, camYaw, lead;  // lead: Y+0x724 alone
     float right[3], up[3], fwd[3];
 };
 constexpr int kRecords = 32;
@@ -73,12 +73,13 @@ __declspec(noinline) bool SehWrite(uintptr_t at, const void* in, size_t n) noexc
     }
 }
 
-void Push(float yaw, float camYaw, const float* rows) {
+void Push(float yaw, float camYaw, float lead, const float* rows) {
     const LONG i = InterlockedIncrement(&g_recordHead) - 1;
     Record& r = g_records[i % kRecords];
     InterlockedIncrement(&r.seq);  // odd: being written
     r.yaw = yaw;
     r.camYaw = camYaw;
+    r.lead = lead;
     for (int k = 0; k < 3; ++k) {
         r.right[k] = rows[k];
         r.up[k] = rows[4 + k];
@@ -142,7 +143,7 @@ bool GameHook(uintptr_t y, float* pitch) noexcept {
     SehRead(y + kLeadYaw, &camYaw[0], 4);
     SehRead(y + kRecoilYaw, &camYaw[1], 4);
     // The last frame's record: the yaw it applied, the frame it left.
-    if (g_haveYaw) Push(static_cast<float>(g_yawUsed), camYaw[0] + camYaw[1], rows);
+    if (g_haveYaw) Push(static_cast<float>(g_yawUsed), camYaw[0] + camYaw[1], camYaw[0], rows);
     // The body turned by the head's yaw since, about its up row.
     const double d = g_haveYaw ? Wrap(yaw - g_yawUsed) : 0.0;
     if (d != 0.0) {
@@ -447,7 +448,13 @@ bool headDriveCamera(const double axes[3][3], double qGame[3][3]) {
     }
     double match = 0, offBody = 0;
     if (!Heading(bestRecord, f, &match, &offBody)) return false;
-    const double psi = bestRecord.yaw + offBody;
+    // The stick's lead is a turn of the world, not of the camera in it: on
+    // the ground the stick turns the camera off the body (Y+0x724) and the
+    // body follows a second later (flight of 2026-09-24: in ADS the crosshair
+    // slid, the world held, then snapped). Taken out of the camera's yaw, the
+    // world turns with the stick at once and the body's catch-up is no turn.
+    // The recoil's yaw stays in: the crosshair kicks, not the world.
+    const double psi = bestRecord.yaw + offBody - bestRecord.lead;
     const double bestUp[3] = {bestRecord.up[0], bestRecord.up[1], bestRecord.up[2]};
     const double fu = f[0] * bestUp[0] + f[1] * bestUp[1] + f[2] * bestUp[2];
     const double b = -std::asin(std::fmax(-1.0, std::fmin(1.0, fu)));  // positive down
