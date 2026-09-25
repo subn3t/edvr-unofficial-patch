@@ -150,7 +150,7 @@ bool Skipped(Part p) { return (g_skip & p) != 0; }
 uint64_t g_frames = 0, g_panelFrames = 0, g_scanned = 0;
 uint64_t g_turnedView = 0, g_turnedClip = 0, g_turnedOthers = 0, g_otherViews = 0, g_noPose = 0, g_offCentre = 0;
 uint64_t g_anyFrame = 0, g_scaled = 0, g_masks = 0, g_pendingFull = 0, g_ambiguous = 0;
-uint64_t g_lockDrawn = 0, g_lockDeclined = 0, g_lockWarped = 0, g_hudScaled = 0, g_modelMatched = 0;
+uint64_t g_lockDrawn = 0, g_lockDeclined = 0, g_lockWarped = 0, g_hudScaled = 0, g_modelMatched = 0, g_hudTurned = 0;
 double g_lockWarpMaxDeg = 0;
 float g_hudScale = 1.0f;  // experimental.onfoot_hud_scale
 bool g_matchFov = true;   // experimental.onfoot_match_fov
@@ -306,6 +306,11 @@ void DriveFromRows(const float* rows) {
         axes[2][k] = rows[12 + k] / sw;
     }
     g_haveQGame = headDriveCamera(axes, g_qGame);
+    if (!g_haveQGame && headDriveActive()) {
+        // The camera has the head in it, which sample unknown: no residual.
+        memcpy(g_qGame, g_qHead, sizeof(g_qGame));
+        g_haveQGame = true;
+    }
     ComposeQ();
     if (g_haveQGame) {
         const double c = std::fmax(-1.0, std::fmin(1.0, (g_q[0][0] + g_q[1][1] + g_q[2][2] - 1) / 2));
@@ -462,12 +467,32 @@ bool MatchFov(float* rows) {
     return true;
 }
 
+// THE HUD WITH THE HEAD DRIVING THE GAME. The picture turns by what is left
+// of the head once the game's camera has turned (G^T H); the view model --
+// the gun -- is drawn along the game's camera and is not turned, and the
+// shots go along it too. The HUD, drawn in view space, would stay with the
+// head, and its crosshair a degree or two off the shots whenever the game's
+// camera is not quite where the head is: the frames it trails the head, the
+// stick turn's lead, recoil, aim assist (flight of 2026-09-24 18:47: "a hair
+// off center"). So the HUD pass's views (view space, finite far plane) turn
+// with the rest: the HUD stays on the game's camera, the crosshair on the
+// shots.
+bool TurnHud(float* rows) {
+    if (!g_haveQGame || !ViewSpaceRows(rows)) return false;
+    bool finite = false;
+    if (!PerspectiveZ(rows, &finite) || !finite) return false;
+    if (!Armed() || !RotateRows(rows)) return false;
+    ++g_hudTurned;
+    return true;
+}
+
 // b0 at 64: the view's clip rows.
 void TurnView(float* a) {
     if (!IsMainView(a)) {
         const bool turned = TurnSameCamera(a);
         const bool matched = MatchFov(a);
-        if (!turned && !matched) ++g_otherViews;
+        const bool hud = TurnHud(a);
+        if (!turned && !matched && !hud) ++g_otherViews;
         return;
     }
     if (Skipped(kPartView) || !Armed()) return;
@@ -510,7 +535,8 @@ bool TurnClip(float* c) {
     if (!IsMainView(rows)) {
         const bool turned = TurnSameCamera(rows);
         const bool matched = MatchFov(rows);
-        if (turned || matched)
+        const bool hud = TurnHud(rows);
+        if (turned || matched || hud)
             for (int r = 0; r < 4; ++r)
                 for (int col = 0; col < 4; ++col) c[4 * col + r] = rows[4 * r + col];
         return false;
@@ -775,7 +801,8 @@ void Report() {
                     "left alone); copies turned: %llu in any frame, %llu scaled, %llu shadow masks, in "
                     "%llu scanned writes (%llu missed, every pending slot taken); %llu without a head pose, %llu "
                     "off-centre, %llu frames with the identity camera; head-locked view: %llu drawn, %llu declined%s%s%s, "
-                    "%llu timewarped (largest %.2f degrees); %llu view-model views matched to the world's field, %llu HUD views scaled; "
+                    "%llu timewarped (largest %.2f degrees); %llu view-model views matched to the world's field, %llu HUD views scaled "
+                    "(%llu turned with the game's camera); "
                     "stereo: %s, %llu camera writes moved (%llu in view space, x%.2f), %llu written again for the other eye (%llu failed, %llu "
                     "not discards), %llu new eye targets, left eye = %s pipeline%s, half IPD %.2f mm; "
                     "head yaw %.1f pitch %.1f roll %.1f.",
@@ -783,7 +810,7 @@ void Report() {
                     U(g_otherViews), U(g_anyFrame), U(g_scaled), U(g_masks), U(g_scanned),
                     U(g_pendingFull), U(g_noPose), U(g_offCentre), U(g_ambiguous), U(g_lockDrawn), U(g_lockDeclined),
                     g_lockDeclined ? " (last: " : "", g_lockDeclined ? g_lockWhy : "", g_lockDeclined ? ")" : "",
-                    U(g_lockWarped), g_lockWarpMaxDeg, U(g_modelMatched), U(g_hudScaled), g_stereoOn ? "on" : "off", U(g_moved), U(g_movedNear), g_nearEye,
+                    U(g_lockWarped), g_lockWarpMaxDeg, U(g_modelMatched), U(g_hudScaled), U(g_hudTurned), g_stereoOn ? "on" : "off", U(g_moved), U(g_movedNear), g_nearEye,
                     U(g_rewrites), U(g_rewriteFails), U(g_notDiscard), U(g_newTargets),
                     g_leftPipe == 0 ? "first" : "second", g_leftKnown ? "" : " (assumed)", g_halfIpd * 1000,
                     g_lastYaw, g_lastPitch,
@@ -791,8 +818,8 @@ void Report() {
     g_frames = g_panelFrames = g_turnedView = g_turnedClip = g_turnedOthers = g_otherViews = 0;
     g_anyFrame = g_scaled = g_masks = g_scanned = g_pendingFull = 0;
     g_noPose = g_offCentre = g_ambiguous = 0;
-    g_lockDrawn = g_lockDeclined = g_lockWarped = g_hudScaled = g_modelMatched = 0;
-    g_moved = g_movedNear = g_rewrites = g_rewriteFails = g_notDiscard = g_newTargets = 0;
+    g_lockDrawn = g_lockDeclined = g_lockWarped = g_hudScaled = g_modelMatched = g_hudTurned = 0;
+    g_moved =g_movedNear = g_rewrites = g_rewriteFails = g_notDiscard = g_newTargets = 0;
     g_lockWarpMaxDeg = 0;
 }
 
