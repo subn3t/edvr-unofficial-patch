@@ -851,7 +851,17 @@ bool TurnMask(float* f, UINT floats, EditList* inv = nullptr) {
         for (int k = 0; k < 3; ++k)
             v[4 * i + k] = static_cast<float>(g_q[0][i] * old[0][k] + g_q[1][i] * old[1][k] + g_q[2][i] * old[2][k]);
     ++g_masks;
-    InverseEdits(f + 4, 4, inv);  // rows 1-4: the inverse projection, in view space
+    // The eye (part "eyelight"). The mask's shader (read from its bytecode,
+    // 2026-09-25) rebuilds each pixel's view position as linear depth times
+    // (ndc.x * row 1 + ndc.y * row 2 + row 4) -- row 3 unread -- and takes
+    // it into the light's space as v.x * row 7 + v.y * row 8 + v.z * row 9 +
+    // row 10. Drawn from the moved eye, v is that eye's; the centre's is
+    // v + (offset, 0, 0): row 10 gains offset * row 7. (Edited in row 3, as
+    // an inverse projection, the moved eye's mask went unmoved: a face edge-on
+    // to the sun fell into shadow in that eye only, the eye dump of
+    // 2026-09-25.)
+    if (inv && inv->n + 3 <= kMaxEdits)
+        for (UINT k = 0; k < 3; ++k) inv->e[inv->n++] = {40 + k, f[28 + k]};
     return true;
 }
 
