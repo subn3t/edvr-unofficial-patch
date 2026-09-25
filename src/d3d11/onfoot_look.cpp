@@ -1765,6 +1765,8 @@ void CapWrite(ID3D11Resource* res, const void* data, UINT bytes) {
 // told), which pipeline b0 and b1 hold (-1: not moved), its shaders, targets,
 // the constant buffers bound in slots 0-7 of both stages and the pixel
 // shader's resources 0-3, by the capture's buffer ids. Buffer id 0xFFFFFFFE.
+void DumpDraw(ID3D11DeviceContext* ctx);
+
 void CapDraw(ID3D11DeviceContext* ctx) {
     struct {
         uint32_t ordinal;
@@ -1814,6 +1816,230 @@ void CapDraw(ID3D11DeviceContext* ctx) {
             srvs[i]->Release();
         }
     CapRecord(0xFFFFFFFEu, &d, sizeof(d));
+    DumpDraw(ctx);
+}
+
+// --- the per-eye image dump (with the capture) ------------------------------
+//
+// A developer instrument, with the census-key capture. Every texture the
+// capture frame's draws render into (all eight targets and the depth) and
+// every GPU-made texture (render target, depth or UAV) their pixel shaders
+// read, saved raw at the end of that frame to edvr_logs\onfoot_eyes_<n>\ --
+// t<id>.raw, rows tight, mip 0 -- with index.txt: each texture's size,
+// format, bind flags, and the draws (ordinal, pipeline, shaders, slot) that
+// wrote or read it, plus the stereo's IPD, left pipeline and projection.
+// tools\onfoot_eyes.py pairs the two pipelines' textures and lines the eyes
+// up by depth: the first stage where they differ is where the eyes part (the
+// shade and the dark lit differently in each eye, 2026-09-25). Its content is
+// each texture's at the END of the frame: a target used twice holds its last
+// use. A hitch of seconds: the copies are read back one at a time.
+struct DumpUse {
+    uint32_t ordinal;
+    int32_t pipe;
+    uint32_t slot;  // 0-7 a target, 8 the depth, 16+ a pixel resource slot
+    uint32_t vw, vh;  // the draw's first viewport
+    uint64_t vs, ps;
+};
+uint32_t g_dumpVw = 0, g_dumpVh = 0;
+constexpr int kDumpUses = 12;
+struct DumpTex {
+    ID3D11Texture2D* tex;
+    uint32_t id;
+    uint32_t writes, reads;
+    DumpUse use[kDumpUses];  // first writes, then reads, as they come
+    uint32_t used;
+};
+constexpr int kMaxDump = 160;
+DumpTex g_dump[kMaxDump];
+int g_dumpCount = 0;
+ID3D11DeviceContext* g_dumpCtx = nullptr;
+
+void DumpRelease() {
+    for (int i = 0; i < g_dumpCount; ++i)
+        if (g_dump[i].tex) g_dump[i].tex->Release();
+    g_dumpCount = 0;
+}
+
+void DumpNote(ID3D11Resource* r, bool write, uint32_t slot) {
+    if (!r) return;
+    D3D11_RESOURCE_DIMENSION dim;
+    r->GetType(&dim);
+    if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D) return;
+    DumpTex* t = nullptr;
+    for (int i = 0; i < g_dumpCount && !t; ++i)
+        if (static_cast<ID3D11Resource*>(g_dump[i].tex) == r) t = &g_dump[i];
+    if (!t) {
+        if (!write) {
+            // Read only: GPU-made textures, not the game's assets.
+            D3D11_TEXTURE2D_DESC td;
+            static_cast<ID3D11Texture2D*>(r)->GetDesc(&td);
+            if (!(td.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS)))
+                return;
+        }
+        if (g_dumpCount == kMaxDump) return;
+        t = &g_dump[g_dumpCount++];
+        *t = {};
+        t->tex = static_cast<ID3D11Texture2D*>(r);
+        t->tex->AddRef();
+        t->id = CapId(r);
+    }
+    (write ? t->writes : t->reads)++;
+    if (t->used < kDumpUses)
+        t->use[t->used++] = {g_drawOrdinal, g_stereoOn ? g_drawPipe : -2, slot + (write ? 0u : 16u), g_dumpVw, g_dumpVh,
+                             bindingShaderHash(BindSlot::Vs), bindingShaderHash(BindSlot::Ps)};
+}
+
+void DumpDraw(ID3D11DeviceContext* ctx) {
+    g_dumpCtx = ctx;
+    D3D11_VIEWPORT vp{};
+    UINT vpn = 1;
+    ctx->RSGetViewports(&vpn, &vp);
+    g_dumpVw = vpn ? static_cast<uint32_t>(vp.Width) : 0;
+    g_dumpVh = vpn ? static_cast<uint32_t>(vp.Height) : 0;
+    ID3D11RenderTargetView* rtvs[8] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(8, rtvs, &dsv);
+    for (uint32_t i = 0; i < 8; ++i)
+        if (rtvs[i]) {
+            ID3D11Resource* r = nullptr;
+            rtvs[i]->GetResource(&r);
+            DumpNote(r, true, i);
+            if (r) r->Release();
+            rtvs[i]->Release();
+        }
+    if (dsv) {
+        ID3D11Resource* r = nullptr;
+        dsv->GetResource(&r);
+        DumpNote(r, true, 8);
+        if (r) r->Release();
+        dsv->Release();
+    }
+    ID3D11ShaderResourceView* srvs[16] = {};
+    ctx->PSGetShaderResources(0, 16, srvs);
+    for (uint32_t i = 0; i < 16; ++i)
+        if (srvs[i]) {
+            ID3D11Resource* r = nullptr;
+            srvs[i]->GetResource(&r);
+            DumpNote(r, false, i);
+            if (r) r->Release();
+            srvs[i]->Release();
+        }
+}
+
+// Bytes a pixel for the formats the frame uses (0: not saved).
+UINT DumpBytes(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_UINT:
+            return 16;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM:
+        case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R32G32_TYPELESS:
+        case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+            return 8;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT:
+        case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SNORM:
+        case DXGI_FORMAT_R16G16_TYPELESS: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM:
+        case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R32_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32_UINT:
+        case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
+            return 4;
+        case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_UINT:
+        case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_FLOAT:
+        case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SNORM:
+            return 2;
+        case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SNORM:
+        case DXGI_FORMAT_A8_UNORM:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+void DumpWrite() {
+    ID3D11DeviceContext* ctx = g_dumpCtx;
+    ID3D11Device* dev = nullptr;
+    if (ctx) ctx->GetDevice(&dev);
+    wchar_t sub[64];
+    swprintf_s(sub, L"\\onfoot_eyes_%u", g_capNo);
+    const std::wstring dir = Config::get().logDir() + sub;
+    CreateDirectoryW(dir.c_str(), nullptr);
+    FILE* index = nullptr;
+    if (!dev || _wfopen_s(&index, (dir + L"\\index.txt").c_str(), L"w") != 0 || !index) {
+        Log::get().note("onfoot look: eye dump %u: no device or no index file; nothing saved.", g_capNo);
+        if (dev) dev->Release();
+        DumpRelease();
+        return;
+    }
+    fprintf(index, "stereo %d left_pipe %d half_ipd_m %.6f anchor %d sx %.6f sy %.6f near %.6f panel %ux%u\n",
+            g_stereoOn ? 1 : 0, g_leftPipe, g_halfIpd, g_anchor, g_mainScale[0], g_mainScale[1], g_mainNear, g_panelW,
+            g_panelH);
+    constexpr uint64_t kFileCap = 96ull << 20, kTotalCap = 3ull << 30;
+    uint64_t total = 0;
+    int saved = 0, skipped = 0;
+    for (int i = 0; i < g_dumpCount; ++i) {
+        DumpTex& t = g_dump[i];
+        D3D11_TEXTURE2D_DESC td;
+        t.tex->GetDesc(&td);
+        const UINT bpp = DumpBytes(td.Format);
+        const uint64_t bytes = uint64_t(td.Width) * td.Height * bpp;
+        const char* why = nullptr;
+        if (td.SampleDesc.Count > 1) why = "msaa";
+        else if (!bpp) why = "format";
+        else if (bytes > kFileCap) why = "size";
+        else if (total + bytes > kTotalCap) why = "total";
+        fprintf(index, "tex %u %ux%u fmt %d bind 0x%X array %u writes %u reads %u %s", t.id, td.Width, td.Height,
+                int(td.Format), td.BindFlags, td.ArraySize, t.writes, t.reads, why ? why : "saved");
+        for (uint32_t u = 0; u < t.used; ++u)
+            fprintf(index, " | %u %d %u %ux%u %016llx %016llx", t.use[u].ordinal, t.use[u].pipe, t.use[u].slot,
+                    t.use[u].vw, t.use[u].vh, static_cast<unsigned long long>(t.use[u].vs),
+                    static_cast<unsigned long long>(t.use[u].ps));
+        fprintf(index, "\n");
+        if (why) {
+            ++skipped;
+            continue;
+        }
+        D3D11_TEXTURE2D_DESC sd = td;
+        sd.MipLevels = 1;
+        sd.ArraySize = 1;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.MiscFlags = 0;
+        ID3D11Texture2D* staging = nullptr;
+        if (FAILED(dev->CreateTexture2D(&sd, nullptr, &staging)) || !staging) {
+            ++skipped;
+            continue;
+        }
+        ctx->CopySubresourceRegion(staging, 0, 0, 0, 0, t.tex, 0, nullptr);
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (SUCCEEDED(g_realMap ? g_realMap(ctx, staging, 0, D3D11_MAP_READ, 0, &m)
+                                : ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m)) &&
+            m.pData) {
+            wchar_t name[32];
+            swprintf_s(name, L"\\t%u.raw", t.id);
+            FILE* f = nullptr;
+            if (_wfopen_s(&f, (dir + name).c_str(), L"wb") == 0 && f) {
+                for (UINT y = 0; y < td.Height; ++y)
+                    fwrite(static_cast<const char*>(m.pData) + size_t(y) * m.RowPitch, 1, size_t(td.Width) * bpp, f);
+                fclose(f);
+                total += bytes;
+                ++saved;
+            }
+            if (g_realUnmap) g_realUnmap(ctx, staging, 0);
+            else ctx->Unmap(staging, 0);
+        } else {
+            ++skipped;
+        }
+        staging->Release();
+    }
+    fclose(index);
+    dev->Release();
+    Log::get().note("onfoot look: eye dump %u written (onfoot_eyes_%u): %d textures saved (%.0f MB), %d not.", g_capNo,
+                    g_capNo, saved, total / 1048576.0, skipped);
+    DumpRelease();
 }
 
 void CapBegin() {
@@ -1831,6 +2057,7 @@ void CapBegin() {
     fwrite(&placeholder, 4, 1, g_capFile);
     g_capCount = 0;
     g_capPtrCount = 0;
+    DumpRelease();
 }
 
 void CapEnd() {
@@ -1849,6 +2076,7 @@ void CapEnd() {
                     "yaw %.1f pitch %.1f.",
                     g_capNo, g_capNo, g_capCount, g_capPtrCount, g_frameRValid ? "known" : "NOT known", g_lastYaw,
                     g_lastPitch);
+    DumpWrite();
 }
 
 }  // namespace
