@@ -506,6 +506,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\hw_watch.cpp" ^
     "src\d3d11\camera_hunt.cpp" ^
     "src\d3d11\mem_probe.cpp" ^
+    "src\d3d11\head_drive.cpp" ^
     "src\d3d11\shader_sig.cpp" ^
     "src\d3d11\remlok_fix.cpp" "src\d3d11\holo_fix.cpp" ^
     "src\d3d11\target_sharp.cpp" "src\d3d11\night_vision.cpp" ^
