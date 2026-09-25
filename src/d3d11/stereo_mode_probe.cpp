@@ -604,7 +604,10 @@ void KickFrame(bool substituted) {
     const uintptr_t at = RequestAddr();
     uint32_t mode = ~0u;
     if (at && !sehCopy(&mode, at, 4)) mode = ~0u;
-    const bool foot = journalOnFootKnown() && journalOnFoot();
+    // On foot this session: Status.json keeps the last session's "on foot"
+    // until this one's LoadGame, and at a launch the kick fired into the
+    // opening cinematic (2026-09-25 04:12: the movie in the wrong mode).
+    const bool foot = journalGameplay() && journalOnFootKnown() && journalOnFoot();
     if (mode != g_modeWas && g_modeLogs < 40) {
         ++g_modeLogs;
         Log::get().note("onfoot stereo: the game's requested display mode %d -> %d (Status.json: %s).",
