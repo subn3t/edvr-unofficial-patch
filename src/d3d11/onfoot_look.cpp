@@ -110,6 +110,14 @@ double g_qHead[3][3] = {};
 double g_qGame[3][3] = {};
 bool g_haveQGame = false, g_driveTaken = false;
 uint64_t g_driveEarly = 0, g_turnedBeforeDrive = 0;  // the report's
+// The pose each frame was turned with against the one published by the
+// frame's end (its submit's): a head pose published mid-frame means the
+// frame was drawn for one pose and handed over with another -- the whole
+// picture off by the head's turn between them for a frame (the ship's
+// one-frame jump on a head yaw, 2026-09-25, is the suspect).
+long g_poseSeqTaken = 0;
+uint64_t g_poseFrames = 0, g_poseStale = 0, g_poseStaleOver05 = 0;
+double g_poseStaleMaxDeg = 0, g_poseStaleSumDeg = 0;
 double g_hRender[3][3] = {};  // the same pose's rotation in OpenVR axes, for the head-locked view's timewarp
 bool g_qValid = false, g_qTaken = false;
 
@@ -310,6 +318,7 @@ void TakeHeadRotation() {
     if (g_qTaken) return;
     g_qTaken = true;
     float m[12];
+    g_poseSeqTaken = headPoseSequence();
     g_qValid = headPose(m);
     if (!g_qValid) return;
     const double s[3] = {1, 1, -1};
@@ -1024,6 +1033,14 @@ void Report() {
                         U(g_invOtherFrame), U(g_basesMoved), U(g_centreDraws), U(g_skippedDraws));
     g_invOtherFrame = g_basesMoved = g_centreDraws = g_skippedDraws = 0;
     g_invMoved = g_trackedFull = g_trackedRewrites = g_pipeFromSrv = g_pipeFromRtv = 0;
+    if (g_poseFrames)
+        Log::get().note("onfoot look: head pose: %llu of %llu frames saw a newer pose published before their end "
+                        "(turned for one, handed over with another?): mean %.2f, max %.2f degrees apart, %llu over "
+                        "0.5.",
+                        U(g_poseStale), U(g_poseFrames), g_poseStale ? g_poseStaleSumDeg / g_poseStale : 0.0,
+                        g_poseStaleMaxDeg, U(g_poseStaleOver05));
+    g_poseFrames = g_poseStale = g_poseStaleOver05 = 0;
+    g_poseStaleMaxDeg = g_poseStaleSumDeg = 0;
     if (g_driveEarly || g_turnedBeforeDrive)
         Log::get().note("onfoot head drive: the frame's game camera taken ahead of its main view %llu times; %llu "
                         "turns made before it was known.",
@@ -2312,6 +2329,23 @@ void onFootLookStateCleared() {
 }
 
 void onFootLookFrameBoundary() {
+    if (g_qTaken && g_qValid && g_stereoOn) {
+        ++g_poseFrames;
+        if (headPoseSequence() != g_poseSeqTaken) {
+            float now[12];
+            if (headPose(now)) {
+                // The angle between the pose taken and the latest: trace of H_now^T H_taken.
+                double tr = 0;
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j) tr += double(now[4 * i + j]) * g_hRender[i][j];
+                const double deg = std::acos(std::fmax(-1.0, std::fmin(1.0, (tr - 1) / 2))) * 57.29577951308232;
+                ++g_poseStale;
+                g_poseStaleSumDeg += deg;
+                if (deg > 0.5) ++g_poseStaleOver05;
+                if (deg > g_poseStaleMaxDeg) g_poseStaleMaxDeg = deg;
+            }
+        }
+    }
     memProbeFrame();
     headDriveFrame();
     g_driveTaken = false;

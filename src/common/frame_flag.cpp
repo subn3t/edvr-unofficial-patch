@@ -435,6 +435,11 @@ void publishHeadPose(const float* m12) {
     InterlockedIncrement(&s->headPoseSeq);
 }
 
+long headPoseSequence() {
+    Shared* s = map();
+    return s ? s->headPoseSeq : 0;
+}
+
 bool headPose(float* out12) {
     Shared* s = map();
     if (!s || !out12 || s->headPoseSeq == 0) return false;
