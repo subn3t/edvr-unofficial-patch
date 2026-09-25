@@ -27,6 +27,7 @@ constexpr uint8_t kClampBytes[30] = {0x41, 0x0F, 0x2F, 0xC0,                    
                                      0xF3, 0x0F, 0x11, 0x87, 0x1C, 0x07, 0x00, 0x00,  // movss [rdi+71Ch],xmm0
                                      0xF3, 0x0F, 0x11, 0x87, 0x18, 0x07, 0x00, 0x00};  // movss [rdi+718h],xmm0
 constexpr uintptr_t kBodyRows = 0x5B0;  // right, up, forward (float4 rows)
+constexpr uintptr_t kLeadYaw = 0x724, kRecoilYaw = 0x734;  // the camera's yaw off the body (radians)
 
 uintptr_t g_base = 0;
 bool g_tried = false, g_installed = false;
@@ -40,11 +41,14 @@ ULONGLONG g_playerMs = 0;
 double g_yawUsed = 0;
 bool g_haveYaw = false;
 std::atomic<uint64_t> g_driven{0}, g_others{0}, g_noPose{0}, g_adopted{0};
+std::atomic<ULONGLONG> g_drivenMs{0};  // the last game frame the head drove
 
-// A game frame's record: the head yaw it applied and the body frame it left.
+// A game frame's record: the head yaw it applied, the body frame it left,
+// and the camera's yaw off that body (Y+0x724, the stick turn's lead, plus
+// Y+0x734, the recoil's; positive right, as the look's vfC8 applies it).
 struct Record {
     volatile LONG seq;  // odd while written
-    float yaw;
+    float yaw, camYaw;
     float right[3], up[3], fwd[3];
 };
 constexpr int kRecords = 32;
@@ -69,11 +73,12 @@ __declspec(noinline) bool SehWrite(uintptr_t at, const void* in, size_t n) noexc
     }
 }
 
-void Push(float yaw, const float* rows) {
+void Push(float yaw, float camYaw, const float* rows) {
     const LONG i = InterlockedIncrement(&g_recordHead) - 1;
     Record& r = g_records[i % kRecords];
     InterlockedIncrement(&r.seq);  // odd: being written
     r.yaw = yaw;
+    r.camYaw = camYaw;
     for (int k = 0; k < 3; ++k) {
         r.right[k] = rows[k];
         r.up[k] = rows[4 + k];
@@ -132,10 +137,12 @@ bool GameHook(uintptr_t y, float* pitch) noexcept {
         g_noPose.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    float rows[12];
+    float rows[12], camYaw[2] = {};
     if (!SehRead(y + kBodyRows, rows, sizeof(rows))) return false;
+    SehRead(y + kLeadYaw, &camYaw[0], 4);
+    SehRead(y + kRecoilYaw, &camYaw[1], 4);
     // The last frame's record: the yaw it applied, the frame it left.
-    if (g_haveYaw) Push(static_cast<float>(g_yawUsed), rows);
+    if (g_haveYaw) Push(static_cast<float>(g_yawUsed), camYaw[0] + camYaw[1], rows);
     // The body turned by the head's yaw since, about its up row.
     const double d = g_haveYaw ? Wrap(yaw - g_yawUsed) : 0.0;
     if (d != 0.0) {
@@ -153,6 +160,7 @@ bool GameHook(uintptr_t y, float* pitch) noexcept {
     g_haveYaw = true;
     *pitch = static_cast<float>(headPitch);
     g_driven.fetch_add(1, std::memory_order_relaxed);
+    g_drivenMs.store(now, std::memory_order_relaxed);
     return true;
 }
 
@@ -385,11 +393,32 @@ void headDriveConfigure(Config& cfg) {
     if (g_flag) *g_flag = want ? 1 : 0;
 }
 
+// The drawn forward's heading against a record's camera (its body turned by
+// its camera yaw): the cosine between them, and the heading's angle off the
+// record's body (positive right).
+bool Heading(const Record& c, const double* f, double* match, double* offBody) {
+    const double fu = f[0] * c.up[0] + f[1] * c.up[1] + f[2] * c.up[2];
+    double h[3] = {f[0] - fu * c.up[0], f[1] - fu * c.up[1], f[2] - fu * c.up[2]};
+    const double hl = std::sqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+    if (hl < 1e-3) return false;
+    for (double& v : h) v /= hl;
+    const double hf = h[0] * c.fwd[0] + h[1] * c.fwd[1] + h[2] * c.fwd[2];
+    const double hr = h[0] * c.right[0] + h[1] * c.right[1] + h[2] * c.right[2];
+    const double cy = std::cos(c.camYaw), sy = std::sin(c.camYaw);
+    *match = hf * cy + hr * sy;  // h . (fwd cos + right sin)
+    *offBody = std::atan2(hr, hf);
+    return true;
+}
+
+Record g_lastMatch{};
+bool g_haveLastMatch = false;
+
 bool headDriveCamera(const double axes[3][3], double qGame[3][3]) {
     if (!g_installed || !g_want.load(std::memory_order_relaxed)) return false;
     const double* f = axes[2];
     const LONG head = g_recordHead;
-    double best = -2, bestYaw = 0, bestDelta = 0, bestUp[3] = {};
+    double best = -2;
+    Record bestRecord{};
     for (int k = 0; k < kRecords && k < head; ++k) {
         const Record& r = g_records[(head - 1 - k) % kRecords];
         const LONG s0 = r.seq;
@@ -397,27 +426,29 @@ bool headDriveCamera(const double axes[3][3], double qGame[3][3]) {
         Record c;
         std::memcpy(&c, &r, sizeof(c));
         if (r.seq != s0) continue;
-        const double up[3] = {c.up[0], c.up[1], c.up[2]};
-        const double fu = f[0] * up[0] + f[1] * up[1] + f[2] * up[2];
-        double h[3] = {f[0] - fu * up[0], f[1] - fu * up[1], f[2] - fu * up[2]};
-        const double hl = std::sqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
-        if (hl < 1e-3) continue;
-        for (double& v : h) v /= hl;
-        const double cf = h[0] * c.fwd[0] + h[1] * c.fwd[1] + h[2] * c.fwd[2];
-        if (cf > best) {
-            best = cf;
-            bestYaw = c.yaw;
-            bestDelta = std::atan2(h[0] * c.right[0] + h[1] * c.right[1] + h[2] * c.right[2], cf);
-            for (int i = 0; i < 3; ++i) bestUp[i] = up[i];
+        double match = 0, off = 0;
+        if (Heading(c, f, &match, &off) && match > best) {
+            best = match;
+            bestRecord = c;
         }
     }
-    // Within 10 degrees of a frame's body: that frame's head sample.
-    if (best < 0.985) {
+    // Within 3 degrees of a frame's camera: that frame's head sample. Else
+    // the last match's (its body's turn since is the error: a stick turn in
+    // the gap); with none yet, no residual at all -- never the whole head
+    // on top of a camera that already has it.
+    if (best >= 0.9986) {
+        g_matched.fetch_add(1, std::memory_order_relaxed);
+        g_lastMatch = bestRecord;
+        g_haveLastMatch = true;
+    } else {
         g_unmatched.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        if (!g_haveLastMatch) return false;
+        bestRecord = g_lastMatch;
     }
-    g_matched.fetch_add(1, std::memory_order_relaxed);
-    const double psi = bestYaw + bestDelta;
+    double match = 0, offBody = 0;
+    if (!Heading(bestRecord, f, &match, &offBody)) return false;
+    const double psi = bestRecord.yaw + offBody;
+    const double bestUp[3] = {bestRecord.up[0], bestRecord.up[1], bestRecord.up[2]};
     const double fu = f[0] * bestUp[0] + f[1] * bestUp[1] + f[2] * bestUp[2];
     const double b = -std::asin(std::fmax(-1.0, std::fmin(1.0, fu)));  // positive down
     // Ry(psi) Rx(b).
@@ -427,6 +458,11 @@ bool headDriveCamera(const double axes[3][3], double qGame[3][3]) {
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j) qGame[i][j] = ry[i][0] * rx[0][j] + ry[i][1] * rx[1][j] + ry[i][2] * rx[2][j];
     return true;
+}
+
+bool headDriveActive() {
+    return g_installed && g_want.load(std::memory_order_relaxed) &&
+           GetTickCount64() - g_drivenMs.load(std::memory_order_relaxed) < 500;
 }
 
 void headDriveNoteResidual(double degrees) {

@@ -62,6 +62,11 @@ void headDriveFrame();
 // matches): the head look then turns by the whole head.
 bool headDriveCamera(const double axes[3][3], double qGame[3][3]);
 
+// The head drove a game frame within the last half second: the drawn camera
+// has the head in it even when headDriveCamera cannot say which sample, so
+// the head look must not turn by the whole head again.
+bool headDriveActive();
+
 // The residual the head look turned the frame's main view by, in degrees
 // (the report's average).
 void headDriveNoteResidual(double degrees);
