@@ -721,7 +721,58 @@ bool InMainFrame(const float* b) {
     return false;
 }
 
-void TurnCopies(float* f, UINT floats, Range skipA = {}, Range skipB = {}, EditList* inv = nullptr) {
+// THE LIGHTING'S CAMERA (with "eyelight"; buffers other than b0 and b1).
+// The deferred lights' constants (a 784-byte cb2, capture of 2026-09-25)
+// hold the camera in the frame's world with its position: the view V = R|t
+// (rows 2-5), its inverse R^T|c (rows 6-9) and P V (rows 10-13). Written
+// once for both eyes, the moved eye was lit from the other's place. For the
+// eye e = offset * right: V's translation loses offset in its right row, the
+// inverse's position gains e, P V's x row loses sx * offset. (R the game's
+// camera, not turned by the head: the head's residual turn of the eye's axis
+// is a millimetre at most.)
+uint64_t g_basesMoved = 0, g_centreDraws = 0;
+bool BasisEdits(const float* b, UINT at, EditList* out) {
+    if (!out || out->n + 3 > kMaxEdits) return false;
+    for (const bool byColumns : {false, true}) {
+        float m[16];
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c) m[4 * r + c] = byColumns ? b[4 * c + r] : b[4 * r + c];
+        if (m[12] != 0.0f || m[13] != 0.0f || m[14] != 0.0f || m[15] != 1.0f) continue;
+        bool view = true, inverse = true;
+        for (int i = 0; i < 3; ++i)
+            for (int k = 0; k < 3; ++k) {
+                view &= std::fabs(m[4 * i + k] - g_frameR[i][k]) < 1e-3;
+                inverse &= std::fabs(m[4 * i + k] - g_frameR[k][i]) < 1e-3;
+            }
+        auto index = [&](int r, int c) { return at + (byColumns ? 4 * c + r : 4 * r + c); };
+        if (view) {
+            out->e[out->n++] = {index(0, 3), -1.0f};
+            return true;
+        }
+        if (inverse) {
+            for (int k = 0; k < 3; ++k) out->e[out->n++] = {index(k, 3), static_cast<float>(g_frameR[0][k])};
+            return true;
+        }
+    }
+    return false;
+}
+
+// A forward copy of the main camera in the frame's world (turned; either
+// layout): its x row's translation, as b0's.
+bool ForwardEdits(const float* b, UINT at, bool byColumns, EditList* out) {
+    if (!out || out->n + 1 > kMaxEdits) return false;
+    float m[16];
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) m[4 * r + c] = byColumns ? b[4 * c + r] : b[4 * r + c];
+    if (!Near(m[11], g_mainNear, 0.02 * g_mainNear)) return false;
+    const double sw = RowLength(m + 12);
+    if (sw < 1e-6) return false;
+    out->e[out->n++] = {at + (byColumns ? 12 : 3), static_cast<float>(-RowLength(m) / sw)};
+    return true;
+}
+
+void TurnCopies(float* f, UINT floats, Range skipA = {}, Range skipB = {}, EditList* inv = nullptr,
+                bool bases = false) {
     // Without this frame's R only the frame-free test runs: the sky's block is
     // written before the frame's b1 names the camera.
     const bool haveR = g_frameRValid && g_frameRUsable;
@@ -732,15 +783,24 @@ void TurnCopies(float* f, UINT floats, Range skipA = {}, Range skipB = {}, EditL
         // Cheap first: a projection's z row (by rows or by columns).
         const bool zRow = std::fabs(b[8]) < 1e-4 && std::fabs(b[9]) < 1e-4 && std::fabs(b[10]) < 1e-4;
         const bool zCol = std::fabs(b[2]) < 1e-4 && std::fabs(b[6]) < 1e-4 && std::fabs(b[10]) < 1e-4;
+        if (bases && haveR && BasisEdits(b, o, inv)) {
+            ++g_basesMoved;
+            o += 12;
+            continue;
+        }
         float raw[16];
         if (zRow || zCol) memcpy(raw, b, sizeof(raw));
-        if ((zRow || zCol) && !Skipped(kPartFrames) && TurnMatrix(b, MainCameraAnyFrame)) {
+        bool byColumns = false;
+        if ((zRow || zCol) && !Skipped(kPartFrames) && TurnMatrix(b, MainCameraAnyFrame, &byColumns)) {
             ++g_anyFrame;
             // Only the main frame's: the sky's (the galaxy frame's) rebuild
             // their rays at the near plane, where e/near is no small change
             // (flight of 2026-09-25: the moved eye's Milky Way a smear).
-            if (haveR && InMainFrame(raw)) InverseEdits(b, o, inv);
-            else ++g_invOtherFrame;
+            if (haveR && InMainFrame(raw)) {
+                if (!InverseEdits(b, o, inv) && bases && ForwardEdits(b, o, byColumns, inv)) ++g_basesMoved;
+            } else {
+                ++g_invOtherFrame;
+            }
             o += 12;
             continue;
         }
@@ -788,7 +848,7 @@ void TurnBuffer(float* mapped, UINT floats, ID3D11Resource* res) {
     memcpy(work, mapped, floats * 4);
     const uint64_t before = g_anyFrame + g_scaled + g_masks;
     EditList inv{};
-    TurnCopies(work, floats, {}, {}, &inv);
+    TurnCopies(work, floats, {}, {}, &inv, true);
     TurnMask(work, floats, &inv);
     const bool moved = StereoTrack(res, work, floats, inv);
     if (moved || before != g_anyFrame + g_scaled + g_masks) memcpy(mapped, work, floats * 4);
@@ -927,11 +987,12 @@ void Report() {
         Log::get().note("onfoot stereo: the lighting's eye: %llu inverse copies moved, %llu buffers kept (%llu refused, "
                         "all %d taken), %llu written again for the other eye; draws with no depth target of theirs "
                         "given an eye by the depth they read %llu, by their target %llu%s; %llu camera copies in "
-                        "another world frame (the sky's) left.",
+                        "another world frame (the sky's) left; %llu of the lights' camera copies moved; %llu draws "
+                        "given the game's own camera (onfoot_stereo_centre_vs).",
                         U(g_invMoved), U(g_trackedCount), U(g_trackedFull), kMaxTracked, U(g_trackedRewrites),
                         U(g_pipeFromSrv), U(g_pipeFromRtv), Skipped(kPartEyeLight) ? " (part eyelight left out)" : "",
-                        U(g_invOtherFrame));
-    g_invOtherFrame = 0;
+                        U(g_invOtherFrame), U(g_basesMoved), U(g_centreDraws));
+    g_invOtherFrame = g_basesMoved = g_centreDraws = 0;
     g_invMoved = g_trackedFull = g_trackedRewrites = g_pipeFromSrv = g_pipeFromRtv = 0;
     g_moved =g_movedNear = g_rewrites = g_rewriteFails = g_notDiscard = g_newTargets = 0;
     g_lockWarpMaxDeg = 0;
@@ -1234,7 +1295,16 @@ void DiagFrame() {
 // (+1) or the left (-1), that eye is the camera -- it sees exactly what the
 // flat game shows -- and the other is a whole IPD away.
 int g_anchor = 0;
+// experimental.onfoot_stereo_centre_vs: draws by these vertex shaders take
+// the game's own camera in both eyes (what is at infinity: the eyes must not
+// part it). Found with the capture's draw records.
+constexpr int kPipeCentre = 2;
+uint64_t g_centreVs[16] = {};
+int g_centreVsCount = 0;
+
+
 double PipeOffset(int pipe) {
+    if (pipe == kPipeCentre) return 0;
     const double base = pipe == g_leftPipe ? -g_halfIpd : g_halfIpd;
     return base - g_anchor * g_halfIpd;
 }
@@ -1487,6 +1557,8 @@ bool StereoTrack(ID3D11Resource* res, float* work, UINT floats, const EditList& 
     return true;
 }
 
+void StereoWriteFor(ID3D11DeviceContext* ctx, int pipe);
+
 void StereoDraw(ID3D11DeviceContext* ctx) {
     int src = kFromNone;
     const int pipe = PipeOfDraw(&src);
@@ -1496,6 +1568,19 @@ void StereoDraw(ID3D11DeviceContext* ctx) {
     if (src == kFromDsv) NotePipeTarget(pipe);
     else if (src == kFromSrv) ++g_pipeFromSrv;
     else ++g_pipeFromRtv;
+    int want = pipe;
+    if (g_centreVsCount) {
+        const uint64_t vs = bindingShaderHash(BindSlot::Vs);
+        for (int i = 0; i < g_centreVsCount; ++i)
+            if (g_centreVs[i] == vs) {
+                want = kPipeCentre;
+                ++g_centreDraws;
+            }
+    }
+    StereoWriteFor(ctx, want);
+}
+
+void StereoWriteFor(ID3D11DeviceContext* ctx, int pipe) {
     if (g_b0Edits.n && g_b0Pipe != pipe) {
         Rewrite(ctx, g_viewCb, g_b0Copy, g_b0CopyBytes, g_b0Edits, pipe);
         g_b0Pipe = pipe;
@@ -1759,6 +1844,23 @@ void onFootLookConfigure(Config& cfg) {
     if (ipd != g_ipdMm)
         Log::get().note("onfoot stereo: IPD %s.", ipd > 0 ? "from onfoot_stereo_ipd_mm" : (ipd == 0 ? "the headset's" : "none: the eyes are not moved"));
     g_ipdMm = ipd;
+    const std::string centre = cfg.getString("experimental.onfoot_stereo_centre_vs", "");
+    int centreCount = 0;
+    uint64_t centreVs[16] = {};
+    for (size_t at = 0; at < centre.size() && centreCount < 16;) {
+        const size_t end = centre.find(',', at);
+        const std::string item = centre.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        char* stop = nullptr;
+        const uint64_t v = _strtoui64(item.c_str(), &stop, 16);
+        if (v) centreVs[centreCount++] = v;
+        if (end == std::string::npos) break;
+        at = end + 1;
+    }
+    if (centreCount != g_centreVsCount || memcmp(centreVs, g_centreVs, sizeof(centreVs)) != 0)
+        Log::get().note("onfoot stereo: %d vertex shader(s) drawn from the game's own camera in both eyes (\"%s\").",
+                        centreCount, centre.c_str());
+    memcpy(g_centreVs, centreVs, sizeof(centreVs));
+    g_centreVsCount = centreCount;
     const float nearEye = cfg.getFloat("experimental.onfoot_stereo_near_eye", 1.0f);
     const double nearClamped = nearEye < 0 ? 0.0 : (nearEye > 1 ? 1.0 : nearEye);
     if (nearClamped != g_nearEye)
