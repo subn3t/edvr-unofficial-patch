@@ -439,6 +439,8 @@ void announceHeadForward(float tx, float ty);
 // nothing has published, which the caller must treat as "leave it alone".
 void publishHeadPose(const float* m12);
 bool headPose(float* out12);
+// headPose's change stamp: one more at each publish (0: none yet).
+long headPoseSequence();
 bool headForward(float* tx, float* ty);
 
 // THE SETTINGS MENU'S CHANNEL (docs/settings-menu.md). The d3d11 half owns
