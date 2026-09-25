@@ -60,7 +60,9 @@ void headDriveFrame();
 // sample the game applied for it, its pitch as the game clamped it. False
 // when the drive is not driving this camera (off, not installed, no record
 // matches): the head look then turns by the whole head.
-bool headDriveCamera(const double axes[3][3], double qGame[3][3]);
+// early: a view of the frame's camera before its main view (another
+// projection): only a record's match counts -- no seeking, no fallback.
+bool headDriveCamera(const double axes[3][3], double qGame[3][3], bool early = false);
 
 // The head drove a game frame within the last half second: the drawn camera
 // has the head in it even when headDriveCamera cannot say which sample, so

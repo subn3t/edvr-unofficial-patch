@@ -109,6 +109,7 @@ double g_q[3][3] = {};
 double g_qHead[3][3] = {};
 double g_qGame[3][3] = {};
 bool g_haveQGame = false, g_driveTaken = false;
+uint64_t g_driveEarly = 0, g_turnedBeforeDrive = 0;  // the report's
 double g_hRender[3][3] = {};  // the same pose's rotation in OpenVR axes, for the head-locked view's timewarp
 bool g_qValid = false, g_qTaken = false;
 
@@ -327,9 +328,14 @@ void TakeHeadRotation() {
 
 // The frame's first main view, before it turns: which head sample the game
 // built this camera from, when the head drives it.
-void DriveFromRows(const float* rows) {
+// early: another projection of a camera (the HUD's, the view model's) before
+// the frame's main view. The frame's game camera must be known before its
+// first turn: composed with the last frame's, the head's turn since went into
+// every write turned ahead of the main view -- the ship a few metres off for
+// a frame while the head yawed (flight of 2026-09-25). Taken early only when
+// a record matches (it is then the frame's camera, whatever the projection).
+void DriveFromRows(const float* rows, bool early = false) {
     if (g_driveTaken) return;
-    g_driveTaken = true;
     const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
     if (sx < 1e-6 || sy < 1e-6 || sw < 1e-6) return;
     double axes[3][3];
@@ -338,6 +344,17 @@ void DriveFromRows(const float* rows) {
         axes[1][k] = rows[4 + k] / sy;
         axes[2][k] = rows[12 + k] / sw;
     }
+    if (early) {
+        double q[3][3];
+        if (!headDriveActive() || !headDriveCamera(axes, q, true)) return;
+        memcpy(g_qGame, q, sizeof(q));
+        g_driveTaken = true;
+        g_haveQGame = true;
+        ++g_driveEarly;
+        ComposeQ();
+        return;
+    }
+    g_driveTaken = true;
     g_haveQGame = headDriveCamera(axes, g_qGame);
     if (!g_haveQGame && headDriveActive()) {
         // The camera has the head in it, which sample unknown: no residual.
@@ -379,6 +396,7 @@ bool Armed() {
 // by rows (right/sx, up/sy, (0, 0, 0, 1/near), forward) has the same form.
 // False (untouched) for an off-centre projection, which this does not model.
 bool RotateRows(float* rows) {
+    if (!g_driveTaken && headDriveActive()) ++g_turnedBeforeDrive;
     const double sx = RowLength(rows), sy = RowLength(rows + 4), sw = RowLength(rows + 12);
     if (sx < 1e-6 || sy < 1e-6 || sw < 1e-6) return false;
     const double dot = double(rows[0]) * rows[12] + double(rows[1]) * rows[13] + double(rows[2]) * rows[14];
@@ -522,6 +540,7 @@ bool TurnHud(float* rows) {
 // b0 at 64: the view's clip rows.
 void TurnView(float* a) {
     if (!IsMainView(a)) {
+        if (!g_driveTaken && !Skipped(kPartView) && Armed() && !ViewSpaceRows(a)) DriveFromRows(a, true);
         const bool turned = TurnSameCamera(a);
         const bool matched = MatchFov(a);
         const bool hud = TurnHud(a);
@@ -566,6 +585,7 @@ bool TurnClip(float* c) {
     for (int r = 0; r < 4; ++r)
         for (int col = 0; col < 4; ++col) rows[4 * r + col] = c[4 * col + r];
     if (!IsMainView(rows)) {
+        if (!g_driveTaken && !Skipped(kPartView) && Armed() && !ViewSpaceRows(rows)) DriveFromRows(rows, true);
         const bool turned = TurnSameCamera(rows);
         const bool matched = MatchFov(rows);
         const bool hud = TurnHud(rows);
@@ -994,6 +1014,11 @@ void Report() {
                         U(g_invOtherFrame), U(g_basesMoved), U(g_centreDraws), U(g_skippedDraws));
     g_invOtherFrame = g_basesMoved = g_centreDraws = g_skippedDraws = 0;
     g_invMoved = g_trackedFull = g_trackedRewrites = g_pipeFromSrv = g_pipeFromRtv = 0;
+    if (g_driveEarly || g_turnedBeforeDrive)
+        Log::get().note("onfoot head drive: the frame's game camera taken ahead of its main view %llu times; %llu "
+                        "turns made before it was known.",
+                        U(g_driveEarly), U(g_turnedBeforeDrive));
+    g_driveEarly = g_turnedBeforeDrive = 0;
     g_moved =g_movedNear = g_rewrites = g_rewriteFails = g_notDiscard = g_newTargets = 0;
     g_lockWarpMaxDeg = 0;
 }
