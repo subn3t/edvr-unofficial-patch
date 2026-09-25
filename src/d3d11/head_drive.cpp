@@ -456,13 +456,28 @@ bool Heading(const Record& c, const double* f, double* match, double* offBody) {
 Record g_lastMatch{};
 bool g_haveLastMatch = false;
 
-// The component whose camera, as the game left it, the drawn camera is:
-// its heading within 3 degrees, the nearest in heading and pitch.
+// Components let go (their camera was not the drawn one): not picked again
+// for half a minute.
+struct Refused {
+    uintptr_t y;
+    ULONGLONG ms;
+};
+Refused g_refused[8] = {};
+int g_refusedNext = 0;
+uintptr_t g_seekBest = 0;
+int g_seekRun = 0;
+
+// The component whose camera, as the game left it, the drawn camera is: the
+// only one within a degree in heading and in pitch, the same one for a
+// quarter second of frames. (Flight of 2026-09-24 23:58: at three degrees
+// of heading and any pitch, eight NPCs were picked and driven before the
+// player's, which matched to 0.02 and 0.01 degrees.)
 void Seek(const double* f) {
     g_seeking.store(true, std::memory_order_relaxed);
     const ULONGLONG now = GetTickCount64();
     double bestErr = 1e9, bestH = 0, bestP = 0;
     uintptr_t best = 0;
+    int within = 0;
     for (const Candidate& r : g_candidates) {
         const LONG s0 = r.seq;
         if (s0 & 1) continue;
@@ -476,7 +491,11 @@ void Seek(const double* f) {
         const double m = (h[0] * c.heading[0] + h[1] * c.heading[1] + h[2] * c.heading[2]) / hl;
         const double headingErr = std::acos(std::fmax(-1.0, std::fmin(1.0, m)));
         const double pitchErr = std::fabs(-std::asin(std::fmax(-1.0, std::fmin(1.0, fu))) - c.pitch);
-        if (headingErr > 0.0524) continue;  // 3 degrees
+        if (headingErr > 0.01745 || pitchErr > 0.01745) continue;  // 1 degree
+        bool refused = false;
+        for (const Refused& x : g_refused) refused |= x.y == c.y && now - x.ms < 30000;
+        if (refused) continue;
+        ++within;
         if (headingErr + pitchErr < bestErr) {
             bestErr = headingErr + pitchErr;
             best = c.y;
@@ -484,7 +503,10 @@ void Seek(const double* f) {
             bestP = pitchErr;
         }
     }
-    if (!best || g_pick.load(std::memory_order_relaxed) == best) return;
+    if (within != 1) best = 0;
+    g_seekRun = best && best == g_seekBest ? g_seekRun + 1 : 0;
+    g_seekBest = best;
+    if (!best || g_seekRun < 20 || g_pick.load(std::memory_order_relaxed) == best) return;
     g_pick.store(best, std::memory_order_relaxed);
     Log::get().note("onfoot head drive: picked component %p, the drawn camera's (heading off %.2f, pitch off %.2f degrees)",
                     reinterpret_cast<void*>(best), bestH * 57.29578, bestP * 57.29578);
@@ -510,6 +532,8 @@ bool headDriveCamera(const double axes[3][3], double qGame[3][3]) {
         Log::get().note("onfoot head drive: the drawn camera is not component %p's; seeking",
                         reinterpret_cast<void*>(player));
         g_lost.store(true, std::memory_order_relaxed);
+        g_refused[g_refusedNext++ % 8] = {player, GetTickCount64()};
+        g_seekRun = 0;
         g_player.store(0, std::memory_order_relaxed);
         player = g_seenPlayer = 0;
         g_unmatchedRun = 0;
