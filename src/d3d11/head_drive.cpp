@@ -28,6 +28,7 @@ constexpr uint8_t kClampBytes[30] = {0x41, 0x0F, 0x2F, 0xC0,                    
                                      0xF3, 0x0F, 0x11, 0x87, 0x18, 0x07, 0x00, 0x00};  // movss [rdi+718h],xmm0
 constexpr uintptr_t kBodyRows = 0x5B0;  // right, up, forward (float4 rows)
 constexpr uintptr_t kLeadYaw = 0x724, kRecoilYaw = 0x734;  // the camera's yaw off the body (radians)
+constexpr uintptr_t kPitch = 0x718, kRecoilPitch = 0x738;  // the camera's pitch: [0x718] - [0x738] (positive down)
 
 uintptr_t g_base = 0;
 bool g_tried = false, g_installed = false;
@@ -54,6 +55,7 @@ struct Record {
 constexpr int kRecords = 32;
 Record g_records[kRecords];
 volatile LONG g_recordHead = 0;
+volatile LONG g_recordFloor = 0;  // the first record of the component driven now
 
 __declspec(noinline) bool SehRead(uintptr_t at, void* out, size_t n) noexcept {
     __try {
@@ -113,6 +115,43 @@ bool HeadYawPitch(double* yaw, double* pitch) {
     return true;
 }
 
+// Which component is the player's: some 22 NPCs run the same input update,
+// and the player's goes quiet aboard a ship (flight of 2026-09-24: taking the
+// next caller after a quiet half second drove an NPC after disembarking).
+// While the render side seeks, every component's camera as the game left it
+// goes here; the render side picks the one the drawn camera matches, and
+// that component is adopted at its next call.
+struct Candidate {
+    volatile LONG seq;  // odd while written
+    uintptr_t y;
+    ULONGLONG ms;
+    float heading[3], up[3], pitch;
+};
+constexpr int kCandidates = 256;
+Candidate g_candidates[kCandidates];
+std::atomic<bool> g_seeking{true};
+std::atomic<uintptr_t> g_pick{0};
+
+void NoteCandidate(uintptr_t y, ULONGLONG now) noexcept {
+    float rows[12], lead = 0, recoil = 0, pitch = 0, recoilPitch = 0;
+    if (!SehRead(y + kBodyRows, rows, sizeof(rows))) return;
+    SehRead(y + kLeadYaw, &lead, 4);
+    SehRead(y + kRecoilYaw, &recoil, 4);
+    SehRead(y + kPitch, &pitch, 4);
+    SehRead(y + kRecoilPitch, &recoilPitch, 4);
+    const double c = std::cos(lead + recoil), s = std::sin(lead + recoil);
+    Candidate& k = g_candidates[((y >> 7) ^ (y >> 17)) % kCandidates];
+    InterlockedIncrement(&k.seq);
+    k.y = y;
+    k.ms = now;
+    for (int i = 0; i < 3; ++i) {
+        k.heading[i] = static_cast<float>(rows[8 + i] * c + rows[i] * s);
+        k.up[i] = rows[4 + i];
+    }
+    k.pitch = pitch - recoilPitch;
+    InterlockedIncrement(&k.seq);
+}
+
 // Called by the stub on the game's thread, once a frame per look component
 // that runs the input update, with rdi (the component) and the candidate
 // pitch (in: the stick's; out: the head's). True: use *pitch.
@@ -120,14 +159,17 @@ bool GameHook(uintptr_t y, float* pitch) noexcept {
     if (!g_want.load(std::memory_order_relaxed)) return false;
     const ULONGLONG now = GetTickCount64();
     const uintptr_t player = g_player.load(std::memory_order_relaxed);
+    if (g_seeking.load(std::memory_order_relaxed)) NoteCandidate(y, now);
     if (y != player) {
-        // Another component: the player's once the last one has been quiet
-        // for half a second (a new session, a new body), else not ours.
-        if (player && now - g_playerMs < 500) {
+        // Another component: ours only when the render side picked it.
+        if (y != g_pick.load(std::memory_order_relaxed)) {
             g_others.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
+        g_recordFloor = g_recordHead;
         g_player.store(y, std::memory_order_relaxed);
+        g_pick.store(0, std::memory_order_relaxed);
+        g_seeking.store(false, std::memory_order_relaxed);
         g_adopted.fetch_add(1, std::memory_order_relaxed);
         g_haveYaw = false;
     }
@@ -414,13 +456,73 @@ bool Heading(const Record& c, const double* f, double* match, double* offBody) {
 Record g_lastMatch{};
 bool g_haveLastMatch = false;
 
+// The component whose camera, as the game left it, the drawn camera is:
+// its heading within 3 degrees, the nearest in heading and pitch.
+void Seek(const double* f) {
+    g_seeking.store(true, std::memory_order_relaxed);
+    const ULONGLONG now = GetTickCount64();
+    double bestErr = 1e9, bestH = 0, bestP = 0;
+    uintptr_t best = 0;
+    for (const Candidate& r : g_candidates) {
+        const LONG s0 = r.seq;
+        if (s0 & 1) continue;
+        Candidate c;
+        std::memcpy(&c, &r, sizeof(c));
+        if (r.seq != s0 || !c.y || now - c.ms > 250) continue;
+        const double fu = f[0] * c.up[0] + f[1] * c.up[1] + f[2] * c.up[2];
+        double h[3] = {f[0] - fu * c.up[0], f[1] - fu * c.up[1], f[2] - fu * c.up[2]};
+        const double hl = std::sqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+        if (hl < 1e-3) continue;
+        const double m = (h[0] * c.heading[0] + h[1] * c.heading[1] + h[2] * c.heading[2]) / hl;
+        const double headingErr = std::acos(std::fmax(-1.0, std::fmin(1.0, m)));
+        const double pitchErr = std::fabs(-std::asin(std::fmax(-1.0, std::fmin(1.0, fu))) - c.pitch);
+        if (headingErr > 0.0524) continue;  // 3 degrees
+        if (headingErr + pitchErr < bestErr) {
+            bestErr = headingErr + pitchErr;
+            best = c.y;
+            bestH = headingErr;
+            bestP = pitchErr;
+        }
+    }
+    if (!best || g_pick.load(std::memory_order_relaxed) == best) return;
+    g_pick.store(best, std::memory_order_relaxed);
+    Log::get().note("onfoot head drive: picked component %p, the drawn camera's (heading off %.2f, pitch off %.2f degrees)",
+                    reinterpret_cast<void*>(best), bestH * 57.29578, bestP * 57.29578);
+}
+
+int g_unmatchedRun = 0;
+uintptr_t g_seenPlayer = 0;
+std::atomic<bool> g_lost{false};
+
 bool headDriveCamera(const double axes[3][3], double qGame[3][3]) {
     if (!g_installed || !g_want.load(std::memory_order_relaxed)) return false;
     const double* f = axes[2];
-    const LONG head = g_recordHead;
+    uintptr_t player = g_player.load(std::memory_order_relaxed);
+    if (player != g_seenPlayer) {
+        g_seenPlayer = player;
+        g_unmatchedRun = 0;
+        g_haveLastMatch = false;
+        g_lost.store(false, std::memory_order_relaxed);
+    }
+    // Half a second of drawn frames none of its records match: the drawn
+    // camera is not the one driven. Let it go and seek again.
+    if (player && g_unmatchedRun >= 45) {
+        Log::get().note("onfoot head drive: the drawn camera is not component %p's; seeking",
+                        reinterpret_cast<void*>(player));
+        g_lost.store(true, std::memory_order_relaxed);
+        g_player.store(0, std::memory_order_relaxed);
+        player = g_seenPlayer = 0;
+        g_unmatchedRun = 0;
+        g_haveLastMatch = false;
+    }
+    if (!player) {
+        Seek(f);
+        return false;
+    }
+    const LONG head = g_recordHead, floor = g_recordFloor;
     double best = -2;
     Record bestRecord{};
-    for (int k = 0; k < kRecords && k < head; ++k) {
+    for (int k = 0; k < kRecords && k < head - floor; ++k) {
         const Record& r = g_records[(head - 1 - k) % kRecords];
         const LONG s0 = r.seq;
         if (s0 & 1) continue;
@@ -439,10 +541,12 @@ bool headDriveCamera(const double axes[3][3], double qGame[3][3]) {
     // on top of a camera that already has it.
     if (best >= 0.9986) {
         g_matched.fetch_add(1, std::memory_order_relaxed);
+        g_unmatchedRun = 0;
         g_lastMatch = bestRecord;
         g_haveLastMatch = true;
     } else {
         g_unmatched.fetch_add(1, std::memory_order_relaxed);
+        ++g_unmatchedRun;
         if (!g_haveLastMatch) return false;
         bestRecord = g_lastMatch;
     }
@@ -468,7 +572,7 @@ bool headDriveCamera(const double axes[3][3], double qGame[3][3]) {
 }
 
 bool headDriveActive() {
-    return g_installed && g_want.load(std::memory_order_relaxed) &&
+    return g_installed && g_want.load(std::memory_order_relaxed) && g_player.load(std::memory_order_relaxed) &&
            GetTickCount64() - g_drivenMs.load(std::memory_order_relaxed) < 500;
 }
 
