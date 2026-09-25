@@ -32,7 +32,7 @@ namespace edvr {
 // version REFUSES the channel -- from then on every call here reads as "no
 // answer" and writes nothing -- and frameFlagPeerMismatch() names the
 // partner's version so the caller's log can say both.
-constexpr uint32_t kFrameFlagVersion = 37;
+constexpr uint32_t kFrameFlagVersion = 38;
 
 // The partner half's layout version when it differs from kFrameFlagVersion,
 // else 0. Nonzero means the channel is refused. Each half asks on a cadence

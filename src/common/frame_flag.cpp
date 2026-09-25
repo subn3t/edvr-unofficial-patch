@@ -251,6 +251,7 @@ struct Shared {
 // The name is built once, at first use. The two DLLs are in the same process,
 // so the channel between them is unaffected.
 //
+// _v38 because the on-foot render pose joined (onFootPoseSeq/onFootPoseM).
 // _v37 because the on-foot stereo's flat frustum, the game's submitted
 // textures and the eye separation joined.
 // _v36 because the on-foot stereo's eyeSwap joined.
@@ -324,7 +325,7 @@ const wchar_t* mappingName() {
     static wchar_t name[64];
     static bool built = false;
     if (!built) {
-        _snwprintf_s(name, _TRUNCATE, L"Local\\edvr_glitch_frame_v37_%lu",
+        _snwprintf_s(name, _TRUNCATE, L"Local\\edvr_glitch_frame_v38_%lu",
                      GetCurrentProcessId());
         built = true;
     }

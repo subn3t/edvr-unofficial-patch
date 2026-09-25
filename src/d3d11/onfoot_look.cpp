@@ -51,6 +51,7 @@ ID3D11Buffer* g_frameCb = nullptr;  // learned b1 (ditto)
 void* g_viewData = nullptr;         // mapped pointers, Map to Unmap
 void* g_frameData = nullptr;
 float g_viewShadow[16] = {};        // b0's clip rows as last written (after any turn: what the GPU got)
+float g_lastB1Clip[16] = {};       // b1's clip transform by columns as last written
 bool g_viewShadowFresh = false;
 UINT g_viewBytes = 0, g_frameFloats = 0;
 
@@ -1020,9 +1021,21 @@ void Report() {
         // On foot per the game and still nothing: say what WAS seen, so a
         // failed detection is not mistaken for "nothing to do".
         if (journalOnFootKnown() && journalOnFoot())
+            // With the last b1 clip's scales (by columns): a flat camera
+            // (x/y 0.5625 at 16:9) in an eye-sized scene is the engine's
+            // stereo built at the headset's size, not the panel's (after a
+            // return from the main menu, 2026-09-25: 2365x2423, never armed).
             Log::get().note("onfoot look: on foot, but no panel-sized G-buffer draw in the last 10 s (panel %ux%u; "
-                            "last R10G10B10A2 target with depth %ux%u). Nothing turned.",
-                            g_panelW, g_panelH, g_lastGbufW, g_lastGbufH);
+                            "last R10G10B10A2 target with depth %ux%u; last b1 clip x %.4f y %.4f w %.4f near %.4f). "
+                            "Nothing turned.",
+                            g_panelW, g_panelH, g_lastGbufW, g_lastGbufH,
+                            std::sqrt(g_lastB1Clip[0] * g_lastB1Clip[0] + g_lastB1Clip[4] * g_lastB1Clip[4] +
+                                      g_lastB1Clip[8] * g_lastB1Clip[8]),
+                            std::sqrt(g_lastB1Clip[1] * g_lastB1Clip[1] + g_lastB1Clip[5] * g_lastB1Clip[5] +
+                                      g_lastB1Clip[9] * g_lastB1Clip[9]),
+                            std::sqrt(g_lastB1Clip[3] * g_lastB1Clip[3] + g_lastB1Clip[7] * g_lastB1Clip[7] +
+                                      g_lastB1Clip[11] * g_lastB1Clip[11]),
+                            g_lastB1Clip[14]);
         g_frames = 0;
         return;
     }
@@ -1262,7 +1275,6 @@ void LockRestore(ID3D11DeviceContext* ctx) {
 // written -- the pass's camera -- and every two seconds logs each pass's eye:
 // position (the point the clip's x, y and w rows share), axes, projection, and
 // the offset between the passes in the first one's axes, with the head's yaw.
-float g_lastB1Clip[16] = {};
 bool g_lastB1Valid = false, g_diagWasBound = false;
 constexpr int kDiagPasses = 6;
 struct DiagPass {
