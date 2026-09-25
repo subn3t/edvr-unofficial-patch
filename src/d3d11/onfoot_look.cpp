@@ -256,7 +256,7 @@ struct Tracked {
     EditList edits;
     float copy[kMaxScanBytes / 4];
 };
-constexpr int kMaxTracked = 8;
+constexpr int kMaxTracked = 32;
 Tracked g_tracked[kMaxTracked];
 int g_trackedCount = 0;
 uint64_t g_invMoved = 0, g_trackedFull = 0, g_trackedRewrites = 0, g_pipeFromSrv = 0, g_pipeFromRtv = 0;
@@ -1559,8 +1559,11 @@ bool StereoTrack(ID3D11Resource* res, float* work, UINT floats, const EditList& 
     Tracked* t = FindTracked(res);
     if (!t) {
         if (g_trackedCount == kMaxTracked) {
+            // Moved for the eye it is written for, not kept for the other.
             ++g_trackedFull;
-            return false;
+            ApplyEdits(work, work, inv, PredictPipe());
+            g_invMoved += inv.n / 3;
+            return true;
         }
         t = &g_tracked[g_trackedCount++];
         t->buf = static_cast<ID3D11Buffer*>(res);
@@ -1657,6 +1660,10 @@ void StereoFrameBoundary() {
     g_pipeRtvCount[0] = g_pipeRtvCount[1] = 0;
     g_pipeRtvGen = 0;
     g_b0Edits.n = g_b1Edits.n = 0;  // last frame's writes
+    // The lights' constants come from a pool: a new buffer each frame (the
+    // capture of 2026-09-25). Kept past the frame, the list filled with the
+    // last frames' and refused this one's -- left at the other eye's place.
+    UntrackAll();
     for (uint32_t& g : g_fbGen) g = 0;
 
     const bool want = onFootStereoWanted() && g_panelLastFrame && g_haveMain;
