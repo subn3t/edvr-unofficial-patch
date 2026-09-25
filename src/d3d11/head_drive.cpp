@@ -465,10 +465,11 @@ struct Refused {
 Refused g_refused[8] = {};
 int g_refusedNext = 0;
 uintptr_t g_seekBest = 0;
+bool g_ambiguousNoted = false;
 int g_seekRun = 0;
 
 // The component whose camera, as the game left it, the drawn camera is: the
-// only one within a degree in heading and in pitch, the same one for a
+// nearest within a degree in heading and in pitch, the same one for a
 // quarter second of frames. (Flight of 2026-09-24 23:58: at three degrees
 // of heading and any pitch, eight NPCs were picked and driven before the
 // player's, which matched to 0.02 and 0.01 degrees.)
@@ -503,7 +504,15 @@ void Seek(const double* f) {
             bestP = pitchErr;
         }
     }
-    if (within != 1) best = 0;
+    // More than one within a degree (flight of 2026-09-25 02:10: never
+    // picked in eight minutes): the nearest all the same -- the half second
+    // of unmatched frames lets a wrong one go, and it is not picked again.
+    if (within > 1 && !g_ambiguousNoted) {
+        g_ambiguousNoted = true;
+        Log::get().note("onfoot head drive: %d components' cameras within a degree of the drawn one; the nearest (%p, "
+                        "heading off %.2f, pitch off %.2f degrees) is tried first.",
+                        within, reinterpret_cast<void*>(best), bestH * 57.29578, bestP * 57.29578);
+    }
     g_seekRun = best && best == g_seekBest ? g_seekRun + 1 : 0;
     g_seekBest = best;
     if (!best || g_seekRun < 20 || g_pick.load(std::memory_order_relaxed) == best) return;
