@@ -36,7 +36,8 @@ Known issues (next):
 - Build-specific: the three code patches (display mode, look clamp, ADS
   zoom) refuse any build but 332.841.
 
-Tested settings (`[experimental]`): onfoot_head_look = 1, onfoot_stereo = 1,
+One switch: `onfoot_vr = 1` sets all of the following as defaults (a key
+set in the ini still wins). Tested settings (`[experimental]`): onfoot_head_look = 1, onfoot_stereo = 1,
 stereo_mode_probe = 1, onfoot_head_drive = 1, onfoot_stereo_anchor = right,
 onfoot_hud_scale = 0.5, onfoot_match_fov = 1, onfoot_ads_zoom = 0,
 onfoot_render_pose = 1, onfoot_stereo_centre_vs =
