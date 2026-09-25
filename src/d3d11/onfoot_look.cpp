@@ -762,7 +762,7 @@ bool InMainFrame(const float* b) {
 // camera, not turned by the head: the head's residual turn of the eye's axis
 // is a millimetre at most.)
 uint64_t g_basesMoved = 0, g_centreDraws = 0, g_skippedDraws = 0;
-bool BasisEdits(const float* b, UINT at, EditList* out) {
+bool BasisEdits(float* b, UINT at, EditList* out) {
     if (!out || out->n + 3 > kMaxEdits) return false;
     for (const bool byColumns : {false, true}) {
         float m[16];
@@ -776,12 +776,38 @@ bool BasisEdits(const float* b, UINT at, EditList* out) {
                 inverse &= std::fabs(m[4 * i + k] - g_frameR[k][i]) < 1e-3;
             }
         auto index = [&](int r, int c) { return at + (byColumns ? 4 * c + r : 4 * r + c); };
+        // Turned with the head as every other copy of the camera (the head
+        // look's Q in the game's view axes: v = Q v'). Unturned, the lights
+        // were lit for the game's camera while the picture showed the head's:
+        // with the head drive not holding (the whole head in Q), the hull's
+        // lights slid with every head yaw (2026-09-25).
+        const bool turn = !Skipped(kPartFrames) && (view || inverse);
         if (view) {
+            // V' = Q^T V: its rows, translation and all.
+            if (turn) {
+                float n[12];
+                for (int i = 0; i < 3; ++i)
+                    for (int c = 0; c < 4; ++c)
+                        n[4 * i + c] = static_cast<float>(g_q[0][i] * m[c] + g_q[1][i] * m[4 + c] + g_q[2][i] * m[8 + c]);
+                for (int i = 0; i < 3; ++i)
+                    for (int c = 0; c < 4; ++c) b[index(i, c) - at] = n[4 * i + c];
+            }
             out->e[out->n++] = {index(0, 3), -1.0f};
             return true;
         }
         if (inverse) {
-            for (int k = 0; k < 3; ++k) out->e[out->n++] = {index(k, 3), static_cast<float>(g_frameR[0][k])};
+            // V'^-1 = V^-1 Q: its view-axis columns; the position stays.
+            float n[9];
+            for (int k = 0; k < 3; ++k)
+                for (int j = 0; j < 3; ++j)
+                    n[3 * k + j] = turn ? static_cast<float>(m[4 * k] * g_q[0][j] + m[4 * k + 1] * g_q[1][j] +
+                                                             m[4 * k + 2] * g_q[2][j])
+                                        : m[4 * k + j];
+            if (turn)
+                for (int k = 0; k < 3; ++k)
+                    for (int j = 0; j < 3; ++j) b[index(k, j) - at] = n[3 * k + j];
+            // The eye along the turned right axis (the inverse's first column).
+            for (int k = 0; k < 3; ++k) out->e[out->n++] = {index(k, 3), n[3 * k]};
             return true;
         }
     }

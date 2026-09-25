@@ -465,20 +465,23 @@ struct Refused {
 Refused g_refused[8] = {};
 int g_refusedNext = 0;
 uintptr_t g_seekBest = 0;
+uint64_t g_seekCalls = 0, g_seekWithin = 0;
+double g_seekNearestErr = 1e9, g_seekNearestH = 0, g_seekNearestP = 0;
 bool g_ambiguousNoted = false;
 int g_seekRun = 0;
 
 // The component whose camera, as the game left it, the drawn camera is: the
-// nearest within a degree in heading and in pitch, the same one for a
+// clear nearest within two degrees in heading and in pitch, the same one for a
 // quarter second of frames. (Flight of 2026-09-24 23:58: at three degrees
 // of heading and any pitch, eight NPCs were picked and driven before the
 // player's, which matched to 0.02 and 0.01 degrees.)
 void Seek(const double* f) {
     g_seeking.store(true, std::memory_order_relaxed);
     const ULONGLONG now = GetTickCount64();
-    double bestErr = 1e9, bestH = 0, bestP = 0;
+    double bestErr = 1e9, secondErr = 1e9, bestH = 0, bestP = 0, nearestErr = 1e9, nearestH = 0, nearestP = 0;
     uintptr_t best = 0;
     int within = 0;
+    ++g_seekCalls;
     for (const Candidate& r : g_candidates) {
         const LONG s0 = r.seq;
         if (s0 & 1) continue;
@@ -492,18 +495,36 @@ void Seek(const double* f) {
         const double m = (h[0] * c.heading[0] + h[1] * c.heading[1] + h[2] * c.heading[2]) / hl;
         const double headingErr = std::acos(std::fmax(-1.0, std::fmin(1.0, m)));
         const double pitchErr = std::fabs(-std::asin(std::fmax(-1.0, std::fmin(1.0, fu))) - c.pitch);
-        if (headingErr > 0.01745 || pitchErr > 0.01745) continue;  // 1 degree
+        if (headingErr + pitchErr < nearestErr) {
+            nearestErr = headingErr + pitchErr;
+            nearestH = headingErr;
+            nearestP = pitchErr;
+        }
+        if (headingErr > 0.0349 || pitchErr > 0.0349) continue;  // 2 degrees
         bool refused = false;
         for (const Refused& x : g_refused) refused |= x.y == c.y && now - x.ms < 30000;
         if (refused) continue;
         ++within;
         if (headingErr + pitchErr < bestErr) {
+            secondErr = bestErr;
             bestErr = headingErr + pitchErr;
             best = c.y;
             bestH = headingErr;
             bestP = pitchErr;
+        } else if (headingErr + pitchErr < secondErr) {
+            secondErr = headingErr + pitchErr;
         }
     }
+    if (nearestErr < g_seekNearestErr) {
+        g_seekNearestErr = nearestErr;
+        g_seekNearestH = nearestH;
+        g_seekNearestP = nearestP;
+    }
+    if (within) ++g_seekWithin;
+    // Several within two degrees: only a clear nearest (half the next one's
+    // error at most); the half second of unmatched frames still lets a wrong
+    // one go, and it is not picked again for 30 s.
+    if (within > 1 && !(bestErr <= 0.5 * secondErr)) best = 0;
     // More than one within a degree (flight of 2026-09-25 02:10: never
     // picked in eight minutes): the nearest all the same -- the half second
     // of unmatched frames lets a wrong one go, and it is not picked again.
@@ -636,6 +657,13 @@ void headDriveFrame() {
     g_residualSum = 0;
     g_residualCount = 0;
     g_residualMax = 0;
+    if (g_seekCalls)
+        Log::get().note("onfoot head drive: seeking the player's camera: %llu frames, %llu with a component within two "
+                        "degrees; the nearest seen was %.2f off in heading, %.2f in pitch.",
+                        static_cast<unsigned long long>(g_seekCalls), static_cast<unsigned long long>(g_seekWithin),
+                        g_seekNearestH * 57.29578, g_seekNearestP * 57.29578);
+    g_seekCalls = g_seekWithin = 0;
+    g_seekNearestErr = 1e9;
 }
 
 }  // namespace edvr
