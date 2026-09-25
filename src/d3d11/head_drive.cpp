@@ -155,11 +155,16 @@ void NoteCandidate(uintptr_t y, ULONGLONG now) noexcept {
 // Called by the stub on the game's thread, once a frame per look component
 // that runs the input update, with rdi (the component) and the candidate
 // pitch (in: the stick's; out: the head's). True: use *pitch.
+// While the game does not follow the head (headDriveNoteResidual): the
+// drive stands aside, the stick has the look, the head look the whole head.
+std::atomic<ULONGLONG> g_suspendUntil{0};
+
 bool GameHook(uintptr_t y, float* pitch) noexcept {
     if (!g_want.load(std::memory_order_relaxed)) return false;
     const ULONGLONG now = GetTickCount64();
     const uintptr_t player = g_player.load(std::memory_order_relaxed);
     if (g_seeking.load(std::memory_order_relaxed)) NoteCandidate(y, now);
+    if (y == player && now < g_suspendUntil.load(std::memory_order_relaxed)) return false;
     if (y != player) {
         // Another component: ours only when the render side picked it.
         if (y != g_pick.load(std::memory_order_relaxed)) {
@@ -546,12 +551,18 @@ int g_unmatchedRun = 0;
 uintptr_t g_seenPlayer = 0;
 std::atomic<bool> g_lost{false};
 
+int g_bigResidualRun = 0;
+uint64_t g_matchedSinceAdopt = 0, g_suspensions = 0;
+
 bool headDriveCamera(const double axes[3][3], double qGame[3][3], bool early) {
     if (!g_installed || !g_want.load(std::memory_order_relaxed)) return false;
+    if (GetTickCount64() < g_suspendUntil.load(std::memory_order_relaxed)) return false;
     const double* f = axes[2];
     uintptr_t player = g_player.load(std::memory_order_relaxed);
     if (player != g_seenPlayer) {
         g_seenPlayer = player;
+        g_matchedSinceAdopt = 0;
+        g_bigResidualRun = 0;
         g_unmatchedRun = 0;
         g_haveLastMatch = false;
         g_lost.store(false, std::memory_order_relaxed);
@@ -562,7 +573,10 @@ bool headDriveCamera(const double axes[3][3], double qGame[3][3], bool early) {
         Log::get().note("onfoot head drive: the drawn camera is not component %p's; seeking",
                         reinterpret_cast<void*>(player));
         g_lost.store(true, std::memory_order_relaxed);
-        g_refused[g_refusedNext++ % 8] = {player, GetTickCount64()};
+        // Refused only if its records never matched (an NPC): the player's own,
+        // lost in a load-in's first seconds, is to be picked again at once
+        // (2026-09-25 03:36: refused, it matched to 0.00 for 30 s unpicked).
+        if (g_matchedSinceAdopt < 30) g_refused[g_refusedNext++ % 8] = {player, GetTickCount64()};
         g_seekRun = 0;
         g_player.store(0, std::memory_order_relaxed);
         player = g_seenPlayer = 0;
@@ -596,6 +610,7 @@ bool headDriveCamera(const double axes[3][3], double qGame[3][3], bool early) {
     if (early && best < 0.9986) return false;
     if (best >= 0.9986) {
         g_matched.fetch_add(1, std::memory_order_relaxed);
+        ++g_matchedSinceAdopt;
         g_unmatchedRun = 0;
         g_lastMatch = bestRecord;
         g_haveLastMatch = true;
@@ -628,6 +643,7 @@ bool headDriveCamera(const double axes[3][3], double qGame[3][3], bool early) {
 
 bool headDriveActive() {
     return g_installed && g_want.load(std::memory_order_relaxed) && g_player.load(std::memory_order_relaxed) &&
+           GetTickCount64() >= g_suspendUntil.load(std::memory_order_relaxed) &&
            GetTickCount64() - g_drivenMs.load(std::memory_order_relaxed) < 500;
 }
 
@@ -635,6 +651,19 @@ void headDriveNoteResidual(double degrees) {
     g_residualSum += degrees;
     ++g_residualCount;
     if (degrees > g_residualMax) g_residualMax = degrees;
+    // Its records match but its camera stays 20 degrees and more off the head
+    // for half a second: the game is not taking the head's turn (the first
+    // seconds of a load-in on foot, 2026-09-25 03:36: 33 degrees on
+    // average, the view stuck). Stand aside two seconds, then try again.
+    g_bigResidualRun = degrees > 20 ? g_bigResidualRun + 1 : 0;
+    if (g_bigResidualRun >= 45) {
+        g_bigResidualRun = 0;
+        g_suspendUntil.store(GetTickCount64() + 2000, std::memory_order_relaxed);
+        if (g_suspensions++ < 5)
+            Log::get().note("onfoot head drive: the game is not following the head (%.0f degrees off for half a "
+                            "second); standing aside for two seconds.",
+                            degrees);
+    }
 }
 
 void headDriveFrame() {
