@@ -1452,6 +1452,8 @@ int PipeOfDraw(int* src) {
         *src = kFromDsv;
         return d;
     }
+    *src = kFromNone;
+    if (Skipped(kPartEyeLight)) return -1;  // as before the lighting's eye
     static const BindSlot kSlots[5] = {BindSlot::PsSrv0, BindSlot::PsSrv1, BindSlot::PsSrv2, BindSlot::PsSrv3,
                                        BindSlot::Rtv0};
     bool same = true;
