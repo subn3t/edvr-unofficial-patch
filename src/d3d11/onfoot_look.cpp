@@ -698,6 +698,29 @@ bool InverseEdits(const float* b, UINT at, EditList* out) {
     return false;
 }
 
+// Sixteen floats (unturned): a copy of the camera in the frame's own world
+// frame -- its right and forward rows (either layout) along this frame's.
+uint64_t g_invOtherFrame = 0;
+bool InMainFrame(const float* b) {
+    for (const bool byColumns : {false, true}) {
+        double r[3], f[3];
+        for (int k = 0; k < 3; ++k) {
+            r[k] = byColumns ? b[4 * k] : b[k];
+            f[k] = byColumns ? b[4 * k + 3] : b[12 + k];
+        }
+        const double rl = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+        const double fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+        if (rl < 1e-6 || fl < 1e-6) continue;
+        double dr = 0, df = 0;
+        for (int k = 0; k < 3; ++k) {
+            dr += r[k] / rl * g_frameR[0][k];
+            df += f[k] / fl * g_frameR[2][k];
+        }
+        if (dr > 1 - kMatch && df > 1 - kMatch) return true;
+    }
+    return false;
+}
+
 void TurnCopies(float* f, UINT floats, Range skipA = {}, Range skipB = {}, EditList* inv = nullptr) {
     // Without this frame's R only the frame-free test runs: the sky's block is
     // written before the frame's b1 names the camera.
@@ -709,9 +732,15 @@ void TurnCopies(float* f, UINT floats, Range skipA = {}, Range skipB = {}, EditL
         // Cheap first: a projection's z row (by rows or by columns).
         const bool zRow = std::fabs(b[8]) < 1e-4 && std::fabs(b[9]) < 1e-4 && std::fabs(b[10]) < 1e-4;
         const bool zCol = std::fabs(b[2]) < 1e-4 && std::fabs(b[6]) < 1e-4 && std::fabs(b[10]) < 1e-4;
+        float raw[16];
+        if (zRow || zCol) memcpy(raw, b, sizeof(raw));
         if ((zRow || zCol) && !Skipped(kPartFrames) && TurnMatrix(b, MainCameraAnyFrame)) {
             ++g_anyFrame;
-            InverseEdits(b, o, inv);
+            // Only the main frame's: the sky's (the galaxy frame's) rebuild
+            // their rays at the near plane, where e/near is no small change
+            // (flight of 2026-09-25: the moved eye's Milky Way a smear).
+            if (haveR && InMainFrame(raw)) InverseEdits(b, o, inv);
+            else ++g_invOtherFrame;
             o += 12;
             continue;
         }
@@ -897,9 +926,12 @@ void Report() {
     if (g_stereoOn || g_invMoved)
         Log::get().note("onfoot stereo: the lighting's eye: %llu inverse copies moved, %llu buffers kept (%llu refused, "
                         "all %d taken), %llu written again for the other eye; draws with no depth target of theirs "
-                        "given an eye by the depth they read %llu, by their target %llu%s.",
+                        "given an eye by the depth they read %llu, by their target %llu%s; %llu camera copies in "
+                        "another world frame (the sky's) left.",
                         U(g_invMoved), U(g_trackedCount), U(g_trackedFull), kMaxTracked, U(g_trackedRewrites),
-                        U(g_pipeFromSrv), U(g_pipeFromRtv), Skipped(kPartEyeLight) ? " (part eyelight left out)" : "");
+                        U(g_pipeFromSrv), U(g_pipeFromRtv), Skipped(kPartEyeLight) ? " (part eyelight left out)" : "",
+                        U(g_invOtherFrame));
+    g_invOtherFrame = 0;
     g_invMoved = g_trackedFull = g_trackedRewrites = g_pipeFromSrv = g_pipeFromRtv = 0;
     g_moved =g_movedNear = g_rewrites = g_rewriteFails = g_notDiscard = g_newTargets = 0;
     g_lockWarpMaxDeg = 0;
