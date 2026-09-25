@@ -128,6 +128,17 @@ struct Pending {
 constexpr int kMaxPending = 32;
 Pending g_pending[kMaxPending] = {};
 constexpr UINT kMaxScanBytes = 16384;
+// Floats of a buffer moved with the eye (the stereo below; InverseEdits):
+// each by coef per metre of the eye's offset.
+struct Edit {
+    UINT index;  // the float in the buffer
+    float coef;
+};
+constexpr int kMaxEdits = 32;
+struct EditList {
+    Edit e[kMaxEdits];
+    int n;
+};
 // How close a copy has to be: the lighting passes compute their copies of the
 // camera apart from the view slot's (up to 2e-4 off).
 constexpr double kMatch = 1e-3;
@@ -142,6 +153,7 @@ enum Part : unsigned {
     kPartScaled = 16,
     kPartTimewarp = 32,
     kPartHudEye = 64,  // the on-foot stereo's move of the helmet HUD's eye
+    kPartEyeLight = 128,  // the on-foot stereo's move of the camera's inverses (the lighting's eye)
 };
 unsigned g_skip = 0;
 bool Skipped(Part p) { return (g_skip & p) != 0; }
@@ -180,8 +192,12 @@ bool g_loggedFirst = false, g_loggedLock = false;
 // x row's length over the w row's, whatever model scale the transform
 // carries). The writes moved are the main camera's: the main view, the same
 // camera through a model, and the helmet HUD (part "hudeye"), in b0's rows at
-// 64 and b1's slot at 4320. The lighting passes' own copies (inverses) are
-// left: lit as if from the centre, three centimetres off.
+// 64 and b1's slot at 4320. The camera's inverses -- the lighting's -- are
+// moved to the same eye (InverseEdits), in b1 and in any other buffer the
+// head look turns them in, and those buffers are written again for the other
+// eye like b0 and b1. A lighting pass binds no depth target of theirs: its
+// eye is the pipeline whose depth it reads as a texture, else whose target
+// it draws into.
 //
 // WHICH EYE. A pass's first camera write comes while the other pipeline's
 // targets are still bound (the write before a pipeline's first draw follows
@@ -220,7 +236,7 @@ constexpr UINT kB1Moved = kClipOffset / 4 + 12;  // by columns: column 3, row 0
 float g_b0Copy[64] = {};
 float g_b1Copy[kMaxScanBytes / 4] = {};
 UINT g_b0CopyBytes = 0, g_b1CopyBytes = 0;
-double g_b0Sx = 0, g_b1Sx = 0;
+EditList g_b0Edits{}, g_b1Edits{};  // the last writes' moves (none: not moved)
 // experimental.onfoot_stereo_near_eye: the share of the eye offset given to
 // writes in VIEW space (the camera's own axes, before the head's turn: the
 // first-person body and what it holds). A first-person weapon drawn smaller
@@ -231,6 +247,23 @@ double g_nearEye = 1.0;
 int g_b0Pipe = -1, g_b1Pipe = -1;
 bool g_viewDiscard = false, g_frameDiscard = false;  // the game's Map of b0 / b1 was a discard
 uint64_t g_moved = 0, g_movedNear = 0, g_rewrites = 0, g_rewriteFails = 0, g_notDiscard = 0, g_newTargets = 0;
+// Other buffers holding the camera's inverses, kept as turned and unmoved
+// (a reference held), written again when a draw of the other pipeline comes.
+struct Tracked {
+    ID3D11Buffer* buf;
+    UINT bytes;
+    int pipe;
+    EditList edits;
+    float copy[kMaxScanBytes / 4];
+};
+constexpr int kMaxTracked = 8;
+Tracked g_tracked[kMaxTracked];
+int g_trackedCount = 0;
+uint64_t g_invMoved = 0, g_trackedFull = 0, g_trackedRewrites = 0, g_pipeFromSrv = 0, g_pipeFromRtv = 0;
+int g_drawPipe = -1, g_drawPipeSrc = 0;  // the last draw's, for the capture
+enum PipeSource { kFromNone = 0, kFromDsv = 1, kFromSrv = 2, kFromRtv = 3 };
+int g_fbPipe = -1, g_fbSrc = kFromNone;
+uint32_t g_fbGen[5] = {};
 
 
 bool Near(double v, double target, double tol) { return std::fabs(v - target) < tol; }
@@ -611,7 +644,7 @@ bool MatchesScaledClip(const float* rows) {
 
 // Sixteen floats at f by rows or by columns, turned in place if test passes.
 template <typename Test>
-bool TurnMatrix(float* f, Test test) {
+bool TurnMatrix(float* f, Test test, bool* byColumnsOut = nullptr) {
     for (const bool byColumns : {false, true}) {
         float m[16];
         for (int r = 0; r < 4; ++r)
@@ -619,6 +652,7 @@ bool TurnMatrix(float* f, Test test) {
         if (!test(m) || !RotateRows(m)) continue;
         for (int r = 0; r < 4; ++r)
             for (int c = 0; c < 4; ++c) (byColumns ? f[4 * c + r] : f[4 * r + c]) = m[4 * r + c];
+        if (byColumnsOut) *byColumnsOut = byColumns;
         return true;
     }
     return false;
@@ -630,7 +664,41 @@ bool TurnMatrix(float* f, Test test) {
 struct Range {
     UINT from, to;
 };
-void TurnCopies(float* f, UINT floats, Range skipA = {}, Range skipB = {}) {
+
+// THE LIGHTING'S EYE (part "eyelight"). The lighting rebuilds each pixel's
+// position from its depth through an inverse of the camera: the "frames"
+// copies, and the shadow mask's inverse projection in view space. By rows
+// (after any transpose) such an inverse is right/sx, up/sy, (0,0,0,1/near),
+// forward: the position comes out as clip x right/sx + ... with w = clip
+// z/near. The pixel was drawn from the moved eye, so it comes out relative
+// to that eye, and is lit against the centre's lights and shadows: off by
+// the eye's offset, each eye the other way (the ~3 cm of the first stereo
+// flight; gone with the eyes not moved, 2026-09-24). Rebuilt for the eye
+// e = offset * right, the position gains e * clip z / near: the z row's xyz
+// gains e / near. At infinity (clip z 0, the reversed depth) nothing
+// changes: a ray to the sky stays as it was.
+
+// Sixteen floats at b (buffer float index at): an inverse of the main
+// projection, in any frame or in view space, by rows or by columns: its z
+// row's edits appended.
+bool InverseEdits(const float* b, UINT at, EditList* out) {
+    if (!out || !g_haveMain || out->n + 3 > kMaxEdits) return false;
+    for (const bool byColumns : {false, true}) {
+        float m[16];
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c) m[4 * r + c] = byColumns ? b[4 * c + r] : b[4 * r + c];
+        if (std::fabs(m[8]) > 1e-4 || std::fabs(m[9]) > 1e-4 || std::fabs(m[10]) > 1e-4) continue;
+        if (!Near(m[11], 1 / g_mainNear, 0.02 / g_mainNear)) continue;
+        const double l0 = RowLength(m);
+        if (!Near(l0, 1 / g_mainScale[0], 0.02 / g_mainScale[0]) || !Near(RowLength(m + 12), 1, 1e-3)) continue;
+        for (int k = 0; k < 3; ++k)
+            out->e[out->n++] = {at + (byColumns ? 4 * k + 2 : 8 + k), static_cast<float>(m[k] / l0 * m[11])};
+        return true;
+    }
+    return false;
+}
+
+void TurnCopies(float* f, UINT floats, Range skipA = {}, Range skipB = {}, EditList* inv = nullptr) {
     // Without this frame's R only the frame-free test runs: the sky's block is
     // written before the frame's b1 names the camera.
     const bool haveR = g_frameRValid && g_frameRUsable;
@@ -643,6 +711,7 @@ void TurnCopies(float* f, UINT floats, Range skipA = {}, Range skipB = {}) {
         const bool zCol = std::fabs(b[2]) < 1e-4 && std::fabs(b[6]) < 1e-4 && std::fabs(b[10]) < 1e-4;
         if ((zRow || zCol) && !Skipped(kPartFrames) && TurnMatrix(b, MainCameraAnyFrame)) {
             ++g_anyFrame;
+            InverseEdits(b, o, inv);
             o += 12;
             continue;
         }
@@ -660,7 +729,7 @@ void TurnCopies(float* f, UINT floats, Range skipA = {}, Range skipB = {}) {
 // goes into light space through it. Unturned, every pixel swung by the head:
 // pitch down, the ground left its shadows; pitch up, everything fell into
 // them. The turned camera's is Q^T R L^T, Q^T times the rows.
-bool TurnMask(float* f, UINT floats) {
+bool TurnMask(float* f, UINT floats, EditList* inv = nullptr) {
     if (floats != 592 / 4 || Skipped(kPartMask)) return false;
     if (!SceneSized(f[0], f[1])) return false;
     float* v = f + 28;
@@ -673,6 +742,7 @@ bool TurnMask(float* f, UINT floats) {
         for (int k = 0; k < 3; ++k)
             v[4 * i + k] = static_cast<float>(g_q[0][i] * old[0][k] + g_q[1][i] * old[1][k] + g_q[2][i] * old[2][k]);
     ++g_masks;
+    InverseEdits(f + 4, 4, inv);  // rows 1-4: the inverse projection, in view space
     return true;
 }
 
@@ -680,14 +750,19 @@ bool TurnMask(float* f, UINT floats) {
 // back is many times slower than ordinary memory (repeated passes over it
 // cost 17 ms of CPU a frame on foot). So it is read ONCE into ordinary
 // memory, matched and turned there, and written back only when turned.
-void TurnBuffer(float* mapped, UINT floats) {
+bool StereoTrack(ID3D11Resource* res, float* work, UINT floats, const EditList& inv);
+void Untrack(const void* res);
+
+void TurnBuffer(float* mapped, UINT floats, ID3D11Resource* res) {
     static float work[kMaxScanBytes / 4];
     if (floats > kMaxScanBytes / 4) return;
     memcpy(work, mapped, floats * 4);
     const uint64_t before = g_anyFrame + g_scaled + g_masks;
-    TurnCopies(work, floats);
-    TurnMask(work, floats);
-    if (before != g_anyFrame + g_scaled + g_masks) memcpy(mapped, work, floats * 4);
+    EditList inv{};
+    TurnCopies(work, floats, {}, {}, &inv);
+    TurnMask(work, floats, &inv);
+    const bool moved = StereoTrack(res, work, floats, inv);
+    if (moved || before != g_anyFrame + g_scaled + g_masks) memcpy(mapped, work, floats * 4);
 }
 
 bool PanelGBufferBound() {
@@ -819,6 +894,13 @@ void Report() {
     g_anyFrame = g_scaled = g_masks = g_scanned = g_pendingFull = 0;
     g_noPose = g_offCentre = g_ambiguous = 0;
     g_lockDrawn = g_lockDeclined = g_lockWarped = g_hudScaled = g_modelMatched = g_hudTurned = 0;
+    if (g_stereoOn || g_invMoved)
+        Log::get().note("onfoot stereo: the lighting's eye: %llu inverse copies moved, %llu buffers kept (%llu refused, "
+                        "all %d taken), %llu written again for the other eye; draws with no depth target of theirs "
+                        "given an eye by the depth they read %llu, by their target %llu%s.",
+                        U(g_invMoved), U(g_trackedCount), U(g_trackedFull), kMaxTracked, U(g_trackedRewrites),
+                        U(g_pipeFromSrv), U(g_pipeFromRtv), Skipped(kPartEyeLight) ? " (part eyelight left out)" : "");
+    g_invMoved = g_trackedFull = g_trackedRewrites = g_pipeFromSrv = g_pipeFromRtv = 0;
     g_moved =g_movedNear = g_rewrites = g_rewriteFails = g_notDiscard = g_newTargets = 0;
     g_lockWarpMaxDeg = 0;
 }
@@ -1151,8 +1233,10 @@ int PredictPipe() { return g_curPipe >= 0 ? g_curPipe : (g_lastPipe >= 0 ? g_las
 
 // b0 as the game wrote it and the head look turned it (mapped, write-combined;
 // rows the turned rows already read out): kept, and moved for a pipeline.
+void ApplyEdits(float* dst, const float* copy, const EditList& l, int pipe);
+
 void StereoViewWritten(float* mapped, const float* rows, bool viewSpace) {
-    g_b0Sx = 0;
+    g_b0Edits.n = 0;
     if (!g_stereoOn || g_viewBytes > sizeof(g_b0Copy)) return;
     double sx = MoveScale(rows);
     if (sx <= 0) return;
@@ -1166,40 +1250,47 @@ void StereoViewWritten(float* mapped, const float* rows, bool viewSpace) {
     }
     memcpy(g_b0Copy, mapped, g_viewBytes);
     g_b0CopyBytes = g_viewBytes;
-    g_b0Sx = sx;
+    g_b0Edits.e[0] = {kB0Moved, static_cast<float>(-sx)};
+    g_b0Edits.n = 1;
     g_b0Pipe = PredictPipe();
-    mapped[kB0Moved] = static_cast<float>(g_b0Copy[kB0Moved] - sx * PipeOffset(g_b0Pipe));
+    ApplyEdits(mapped, g_b0Copy, g_b0Edits, g_b0Pipe);
     ++g_moved;
 }
 
 // b1 in ordinary memory, turned, before it is written back.
-void StereoFrameWritten(float* work, bool viewSpace) {
-    g_b1Sx = 0;
+void StereoFrameWritten(float* work, bool viewSpace, const EditList& inv) {
+    g_b1Edits.n = 0;
     if (!g_stereoOn) return;
     const float* c = work + kClipOffset / 4;
     float rows[16];
     for (int r = 0; r < 4; ++r)
         for (int col = 0; col < 4; ++col) rows[4 * r + col] = c[4 * col + r];
     double sx = MoveScale(rows);
-    if (sx <= 0) return;
-    if (viewSpace) {
-        sx *= g_nearEye;
-        ++g_movedNear;
+    if (sx > 0) {
+        if (viewSpace) {
+            sx *= g_nearEye;
+            ++g_movedNear;
+        }
+        g_b1Edits.e[g_b1Edits.n++] = {kB1Moved, static_cast<float>(-sx)};
     }
+    const int invCount = Skipped(kPartEyeLight) ? 0 : inv.n;
+    for (int i = 0; i < invCount && g_b1Edits.n < kMaxEdits; ++i) g_b1Edits.e[g_b1Edits.n++] = inv.e[i];
+    if (!g_b1Edits.n) return;
     if (!g_frameDiscard) {
         ++g_notDiscard;
+        g_b1Edits.n = 0;
         return;
     }
     memcpy(g_b1Copy, work, g_frameFloats * 4);
     g_b1CopyBytes = g_frameFloats * 4;
-    g_b1Sx = sx;
     g_b1Pipe = PredictPipe();
-    work[kB1Moved] = static_cast<float>(g_b1Copy[kB1Moved] - sx * PipeOffset(g_b1Pipe));
-    ++g_moved;
+    ApplyEdits(work, g_b1Copy, g_b1Edits, g_b1Pipe);
+    if (sx > 0) ++g_moved;
+    g_invMoved += invCount / 3;
 }
 
 // The pipeline whose depth target this draw uses; -1 for none of theirs.
-int PipeOfDraw() {
+int DsvPipe() {
     const uint32_t dg = bindingGeneration(BindSlot::Dsv0);
     if (dg == g_pipeDsvGen) return g_curPipe;
     g_pipeDsvGen = dg;
@@ -1222,12 +1313,60 @@ int PipeOfDraw() {
                 g_curPipe = g_lastPipe >= 0 ? 1 - g_lastPipe : 0;
                 g_pipeTargets[g_pipeTargetCount++] = {res, g_curPipe};
                 ++g_newTargets;
+                g_fbGen[0] = 0;  // the fallback's answer may change
             }
         }
     }
     res->Release();
     if (g_curPipe >= 0) g_lastPipe = g_curPipe;
     return g_curPipe;
+}
+
+// The draw's pipeline: its depth target's; else (a lighting pass: no depth
+// target, the depth read as a texture) the pipeline whose depth it samples in
+// pixel slots 0-3; else whose render target (seen this frame under that
+// pipeline's depth) it draws into.
+int PipeOfDraw(int* src) {
+    const int d = DsvPipe();
+    if (d >= 0) {
+        *src = kFromDsv;
+        return d;
+    }
+    static const BindSlot kSlots[5] = {BindSlot::PsSrv0, BindSlot::PsSrv1, BindSlot::PsSrv2, BindSlot::PsSrv3,
+                                       BindSlot::Rtv0};
+    bool same = true;
+    for (int i = 0; i < 5; ++i) {
+        const uint32_t g = bindingGeneration(kSlots[i]);
+        if (g != g_fbGen[i]) {
+            g_fbGen[i] = g;
+            same = false;
+        }
+    }
+    if (!same) {
+        g_fbPipe = -1;
+        g_fbSrc = kFromNone;
+        for (int i = 0; i < 4 && g_fbPipe < 0; ++i) {
+            void* v = bindingGet(kSlots[i]);
+            ResourceInfo info{};
+            if (!v || !bindingResolve(v, &info) || !info.resource) continue;
+            for (int t = 0; t < g_pipeTargetCount; ++t)
+                if (g_pipeTargets[t].res == info.resource) {
+                    g_fbPipe = g_pipeTargets[t].pipe;
+                    g_fbSrc = kFromSrv;
+                }
+        }
+        void* rtv = bindingGet(BindSlot::Rtv0);
+        ResourceInfo info{};
+        if (g_fbPipe < 0 && rtv && bindingResolve(rtv, &info) && info.resource)
+            for (int p = 0; p < 2; ++p)
+                for (int i = 0; i < g_pipeRtvCount[p]; ++i)
+                    if (g_pipeRtvs[p][i] == info.resource) {
+                        g_fbPipe = p;
+                        g_fbSrc = kFromRtv;
+                    }
+    }
+    *src = g_fbSrc;
+    return g_fbPipe;
 }
 
 // The render target of a draw of a pipeline, remembered for the left-eye match.
@@ -1246,7 +1385,12 @@ void NotePipeTarget(int pipe) {
     if (g_pipeRtvCount[pipe] < 8) g_pipeRtvs[pipe][g_pipeRtvCount[pipe]++] = res;
 }
 
-void Rewrite(ID3D11DeviceContext* ctx, ID3D11Buffer* buf, const float* copy, UINT bytes, UINT moved, double sx,
+void ApplyEdits(float* dst, const float* copy, const EditList& l, int pipe) {
+    const double offset = PipeOffset(pipe);
+    for (int i = 0; i < l.n; ++i) dst[l.e[i].index] = static_cast<float>(copy[l.e[i].index] + l.e[i].coef * offset);
+}
+
+void Rewrite(ID3D11DeviceContext* ctx, ID3D11Buffer* buf, const float* copy, UINT bytes, const EditList& edits,
              int pipe) {
     D3D11_MAPPED_SUBRESOURCE m{};
     if (!g_realMap || !g_realUnmap || !buf || FAILED(g_realMap(ctx, buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)) ||
@@ -1255,22 +1399,85 @@ void Rewrite(ID3D11DeviceContext* ctx, ID3D11Buffer* buf, const float* copy, UIN
         return;
     }
     memcpy(m.pData, copy, bytes);
-    static_cast<float*>(m.pData)[moved] = static_cast<float>(copy[moved] - sx * PipeOffset(pipe));
+    ApplyEdits(static_cast<float*>(m.pData), copy, edits, pipe);
     g_realUnmap(ctx, buf, 0);
     ++g_rewrites;
 }
 
+Tracked* FindTracked(const void* res) {
+    for (int i = 0; i < g_trackedCount; ++i)
+        if (g_tracked[i].buf == res) return &g_tracked[i];
+    return nullptr;
+}
+
+void Untrack(const void* res) {
+    Tracked* t = FindTracked(res);
+    if (!t) return;
+    t->buf->Release();
+    Tracked& last = g_tracked[--g_trackedCount];
+    if (t != &last) {
+        t->buf = last.buf;
+        t->bytes = last.bytes;
+        t->pipe = last.pipe;
+        t->edits = last.edits;
+        memcpy(t->copy, last.copy, last.bytes);
+    }
+}
+
+void UntrackAll() {
+    for (int i = 0; i < g_trackedCount; ++i) g_tracked[i].buf->Release();
+    g_trackedCount = 0;
+}
+
+// A scanned buffer as turned (work): with the camera's inverses in it, kept
+// and moved for the pipeline that draws next; without, no longer ours.
+bool StereoTrack(ID3D11Resource* res, float* work, UINT floats, const EditList& inv) {
+    if (!g_stereoOn || !inv.n || Skipped(kPartEyeLight) || !res) {
+        Untrack(res);
+        return false;
+    }
+    Tracked* t = FindTracked(res);
+    if (!t) {
+        if (g_trackedCount == kMaxTracked) {
+            ++g_trackedFull;
+            return false;
+        }
+        t = &g_tracked[g_trackedCount++];
+        t->buf = static_cast<ID3D11Buffer*>(res);
+        t->buf->AddRef();
+    }
+    t->bytes = floats * 4;
+    t->edits = inv;
+    memcpy(t->copy, work, t->bytes);
+    t->pipe = PredictPipe();
+    ApplyEdits(work, t->copy, t->edits, t->pipe);
+    g_invMoved += inv.n / 3;
+    return true;
+}
+
 void StereoDraw(ID3D11DeviceContext* ctx) {
-    const int pipe = PipeOfDraw();
+    int src = kFromNone;
+    const int pipe = PipeOfDraw(&src);
+    g_drawPipe = pipe;
+    g_drawPipeSrc = src;
     if (pipe < 0) return;
-    NotePipeTarget(pipe);
-    if (g_b0Sx > 0 && g_b0Pipe != pipe) {
-        Rewrite(ctx, g_viewCb, g_b0Copy, g_b0CopyBytes, kB0Moved, g_b0Sx, pipe);
+    if (src == kFromDsv) NotePipeTarget(pipe);
+    else if (src == kFromSrv) ++g_pipeFromSrv;
+    else ++g_pipeFromRtv;
+    if (g_b0Edits.n && g_b0Pipe != pipe) {
+        Rewrite(ctx, g_viewCb, g_b0Copy, g_b0CopyBytes, g_b0Edits, pipe);
         g_b0Pipe = pipe;
     }
-    if (g_b1Sx > 0 && g_b1Pipe != pipe) {
-        Rewrite(ctx, g_frameCb, g_b1Copy, g_b1CopyBytes, kB1Moved, g_b1Sx, pipe);
+    if (g_b1Edits.n && g_b1Pipe != pipe) {
+        Rewrite(ctx, g_frameCb, g_b1Copy, g_b1CopyBytes, g_b1Edits, pipe);
         g_b1Pipe = pipe;
+    }
+    for (int i = 0; i < g_trackedCount; ++i) {
+        Tracked& t = g_tracked[i];
+        if (t.pipe == pipe) continue;
+        Rewrite(ctx, t.buf, t.copy, t.bytes, t.edits, pipe);
+        t.pipe = pipe;
+        ++g_trackedRewrites;
     }
 }
 
@@ -1280,7 +1487,9 @@ void StereoForget() {
     g_pipeDsvGen = g_pipeRtvGen = 0;
     g_leftKnown = g_leftGuessNoted = false;
     g_leftPipe = 0;
-    g_b0Sx = g_b1Sx = 0;
+    g_b0Edits.n = g_b1Edits.n = 0;
+    UntrackAll();
+    for (uint32_t& g : g_fbGen) g = 0;
 }
 
 // The frame that ended: which pipeline the game submitted as the left eye.
@@ -1312,7 +1521,8 @@ void StereoFrameBoundary() {
     }
     g_pipeRtvCount[0] = g_pipeRtvCount[1] = 0;
     g_pipeRtvGen = 0;
-    g_b0Sx = g_b1Sx = 0;  // last frame's writes
+    g_b0Edits.n = g_b1Edits.n = 0;  // last frame's writes
+    for (uint32_t& g : g_fbGen) g = 0;
 
     const bool want = onFootStereoWanted() && g_panelLastFrame && g_haveMain;
     const double ipd = g_ipdMm > 0 ? g_ipdMm / 1000.0 : (g_ipdMm == 0 ? double(eyeSeparation()) : 0.0);
@@ -1377,6 +1587,61 @@ void CapRecord(uint32_t id, const void* data, uint32_t bytes) {
 
 void CapWrite(ID3D11Resource* res, const void* data, UINT bytes) {
     if (g_capFile && data && bytes) CapRecord(CapId(res), data, bytes);
+}
+
+// A draw, after the stereo's writes for it: its pipeline (and how it was
+// told), which pipeline b0 and b1 hold (-1: not moved), its shaders, targets,
+// the constant buffers bound in slots 0-7 of both stages and the pixel
+// shader's resources 0-3, by the capture's buffer ids. Buffer id 0xFFFFFFFE.
+void CapDraw(ID3D11DeviceContext* ctx) {
+    struct {
+        uint32_t ordinal;
+        int32_t pipe, src, b0Pipe, b1Pipe;
+        uint32_t rtv, dsv, tracked;
+        uint64_t vs, ps;
+        uint32_t vsCb[8], psCb[8], psSrv[4];
+    } d{};
+    d.ordinal = g_drawOrdinal;
+    d.pipe = g_stereoOn ? g_drawPipe : -2;
+    d.src = g_drawPipeSrc;
+    d.b0Pipe = g_b0Edits.n ? g_b0Pipe : -1;
+    d.b1Pipe = g_b1Edits.n ? g_b1Pipe : -1;
+    d.tracked = static_cast<uint32_t>(g_trackedCount);
+    ResourceInfo info{};
+    void* rtv = bindingGet(BindSlot::Rtv0);
+    if (rtv && bindingResolve(rtv, &info) && info.resource) d.rtv = CapId(info.resource);
+    info = {};
+    void* dsv = bindingGet(BindSlot::Dsv0);
+    if (dsv && bindingResolve(dsv, &info) && info.resource) d.dsv = CapId(info.resource);
+    d.vs = bindingShaderHash(BindSlot::Vs);
+    d.ps = bindingShaderHash(BindSlot::Ps);
+    ID3D11Buffer* cbs[8] = {};
+    ctx->VSGetConstantBuffers(0, 8, cbs);
+    for (int i = 0; i < 8; ++i)
+        if (cbs[i]) {
+            d.vsCb[i] = CapId(cbs[i]);
+            cbs[i]->Release();
+            cbs[i] = nullptr;
+        }
+    ctx->PSGetConstantBuffers(0, 8, cbs);
+    for (int i = 0; i < 8; ++i)
+        if (cbs[i]) {
+            d.psCb[i] = CapId(cbs[i]);
+            cbs[i]->Release();
+        }
+    ID3D11ShaderResourceView* srvs[4] = {};
+    ctx->PSGetShaderResources(0, 4, srvs);
+    for (int i = 0; i < 4; ++i)
+        if (srvs[i]) {
+            ID3D11Resource* r = nullptr;
+            srvs[i]->GetResource(&r);
+            if (r) {
+                d.psSrv[i] = CapId(r);
+                r->Release();
+            }
+            srvs[i]->Release();
+        }
+    CapRecord(0xFFFFFFFEu, &d, sizeof(d));
 }
 
 void CapBegin() {
@@ -1453,7 +1718,7 @@ void onFootLookConfigure(Config& cfg) {
         Part part;
     } kParts[] = {{"view", kPartView},     {"others", kPartOthers},     {"mask", kPartMask},
                   {"frames", kPartFrames}, {"scaled", kPartScaled},     {"timewarp", kPartTimewarp},
-                  {"hudeye", kPartHudEye}};
+                  {"hudeye", kPartHudEye}, {"eyelight", kPartEyeLight}};
     for (const auto& p : kParts)
         if (skip.find(p.name) != std::string::npos) mask |= p.part;
     if (mask != g_skip) Log::get().note("onfoot look: parts left out: \"%s\" (mask %u).", skip.c_str(), mask);
@@ -1493,6 +1758,7 @@ void onFootLookBeforeDraw(ID3D11DeviceContext* ctx) {
     ++g_drawOrdinal;
     if (g_stereoDiag) DiagDraw();
     if (g_stereoOn && ctx) StereoDraw(ctx);
+    if (g_capFile && ctx) CapDraw(ctx);
     if (!PanelGBufferBound()) return;
     if (g_viewRawFresh && bindingGet(BindSlot::VsCb0) == g_viewCb) {
         g_viewRawFresh = false;
@@ -1517,7 +1783,11 @@ void onFootLookMapped(ID3D11Resource* res, void* data, D3D11_MAP type) {
     }
     // Any other small constant or shader-resource buffer rewritten whole
     // while the panel scene runs: a candidate for camera copies.
-    if (!g_panelLastFrame || type != D3D11_MAP_WRITE_DISCARD) return;
+    // A kept copy the game writes past (not whole, or not seen) is stale.
+    if (!g_panelLastFrame || type != D3D11_MAP_WRITE_DISCARD) {
+        if (g_trackedCount) Untrack(res);
+        return;
+    }
     D3D11_RESOURCE_DIMENSION dim;
     res->GetType(&dim);
     if (dim != D3D11_RESOURCE_DIMENSION_BUFFER) return;
@@ -1532,6 +1802,7 @@ void onFootLookMapped(ID3D11Resource* res, void* data, D3D11_MAP type) {
         }
     }
     ++g_pendingFull;
+    if (g_trackedCount) Untrack(res);
 }
 
 void onFootLookBeforeUnmap(ID3D11Resource* res) {
@@ -1580,10 +1851,11 @@ void onFootLookBeforeUnmap(ID3D11Resource* res) {
             viewSpace = ViewSpaceRows(rows);
         }
         TurnClip(work + kClipOffset / 4);
+        EditList inv{};
         if (Armed())
             TurnCopies(work, g_frameFloats, {kClipOffset / 4, kClipOffset / 4 + 16},
-                       {kPrevPoseOffset / 4, kPrevPoseOffset / 4 + 12});
-        StereoFrameWritten(work, viewSpace);
+                       {kPrevPoseOffset / 4, kPrevPoseOffset / 4 + 12}, &inv);
+        StereoFrameWritten(work, viewSpace, inv);
         memcpy(g_frameData, work, g_frameFloats * 4);
         memcpy(g_eyeClip, work + kClipOffset / 4, sizeof(g_eyeClip));
         g_eyeClipValid = true;
@@ -1593,7 +1865,8 @@ void onFootLookBeforeUnmap(ID3D11Resource* res) {
     } else {
         for (Pending& p : g_pending) {
             if (p.res != res) continue;
-            if (Armed()) TurnBuffer(p.data, p.floats);
+            if (Armed()) TurnBuffer(p.data, p.floats, p.res);
+            else Untrack(p.res);
             p = {};
             break;
         }
