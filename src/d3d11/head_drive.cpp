@@ -432,7 +432,8 @@ ULONGLONG g_reportMs = 0;
 }  // namespace
 
 void headDriveConfigure(Config& cfg) {
-    const bool want = cfg.getBool("experimental.onfoot_head_drive", false);
+    const bool preset = cfg.getBool("experimental.onfoot_vr", false);  // onfoot_look.h, onFootVrPreset
+    const bool want = cfg.getBool("experimental.onfoot_head_drive", preset);
     if (want != g_want.load())
         Log::get().note(want ? "onfoot head drive: ON (live): the head moves the game's own look."
                              : "onfoot head drive: off (live): the stick has the look again.");

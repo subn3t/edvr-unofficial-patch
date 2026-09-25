@@ -2149,7 +2149,11 @@ void CapEnd() {
 }  // namespace
 
 void onFootLookConfigure(Config& cfg) {
-    const bool on = cfg.getBool("experimental.onfoot_head_look", false);
+    // experimental.onfoot_vr: on-foot VR in one switch -- the settings of
+    // the field flights (docs/onfoot-vr.md, Status) as the defaults of the
+    // keys it covers; a key set in the ini still wins.
+    const bool preset = cfg.getBool("experimental.onfoot_vr", false);
+    const bool on = cfg.getBool("experimental.onfoot_head_look", preset);
     if (on != detail::g_onFootLookEnabled)
         Log::get().note(on ? "onfoot look: ON. On foot, the head turns the game's own camera (the panel stays where "
                              "it is and shows the turned view)."
@@ -2166,7 +2170,7 @@ void onFootLookConfigure(Config& cfg) {
         Log::get().note("onfoot look: stereo diagnostic %s.", diag ? "ON (each G-buffer pass's eye logged)" : "off");
     g_stereoDiag = diag;
     g_rtvGen = g_dsvGen = 0;
-    const float hud = cfg.getFloat("experimental.onfoot_hud_scale", 1.0f);
+    const float hud = cfg.getFloat("experimental.onfoot_hud_scale", preset ? 0.5f : 1.0f);
     const float hudClamped = hud < 0.3f ? 0.3f : (hud > 1.5f ? 1.5f : hud);
     if (hudClamped != g_hudScale) Log::get().note("onfoot look: the HUD drawn at %.2f of its size.", hudClamped);
     g_hudScale = hudClamped;
@@ -2194,7 +2198,9 @@ void onFootLookConfigure(Config& cfg) {
     if (ipd != g_ipdMm)
         Log::get().note("onfoot stereo: IPD %s.", ipd > 0 ? "from onfoot_stereo_ipd_mm" : (ipd == 0 ? "the headset's" : "none: the eyes are not moved"));
     g_ipdMm = ipd;
-    const std::string centre = cfg.getString("experimental.onfoot_stereo_centre_vs", "");
+    // The star layer's two draws (2026-09-25; the capture's draw records).
+    const std::string centre =
+        cfg.getString("experimental.onfoot_stereo_centre_vs", preset ? "68dddef04d9894af,f7a6e916f14a3b1a" : "");
     uint64_t centreVs[16] = {};
     const int centreCount = ParseHashes(centre, centreVs);
     if (centreCount != g_centreVsCount || memcmp(centreVs, g_centreVs, sizeof(centreVs)) != 0)
@@ -2220,7 +2226,7 @@ void onFootLookConfigure(Config& cfg) {
         Log::get().note("onfoot stereo: view-space draws (the body, what it holds) take %.2f of the eye offset.",
                         nearClamped);
     g_nearEye = nearClamped;
-    const std::string anchorName = cfg.getString("experimental.onfoot_stereo_anchor", "centre");
+    const std::string anchorName = cfg.getString("experimental.onfoot_stereo_anchor", preset ? "right" : "centre");
     const int anchor = anchorName == "right" ? 1 : (anchorName == "left" ? -1 : 0);
     if (anchor != g_anchor)
         Log::get().note("onfoot stereo: the game's camera is your %s.",

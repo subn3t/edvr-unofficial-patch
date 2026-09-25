@@ -792,7 +792,8 @@ bool onFootStereoHolding() { return g_stereoPatched && g_stereoData && *g_stereo
 bool onFootStereoWanted() { return onFootStereoHolding() && g_quietFrames < 30; }
 
 void stereoModeProbeConfigure(Config& cfg) {
-    const bool stereo = cfg.getBool("experimental.onfoot_stereo", false);
+    const bool preset = cfg.getBool("experimental.onfoot_vr", false);  // onfoot_look.h, onFootVrPreset
+    const bool stereo = cfg.getBool("experimental.onfoot_stereo", preset);
     if (stereo && !g_stereoTried) InstallStereoPatch();
     if (g_stereoData) {
         const uint8_t want = stereo ? 1 : 0;
@@ -811,7 +812,7 @@ void stereoModeProbeConfigure(Config& cfg) {
     if (swap != g_swapWanted)
         Log::get().note("onfoot stereo: eyes %s on foot (live).", swap ? "SWAPPED" : "as the game submits them");
     g_swapWanted = swap;
-    const bool on = cfg.getBool("experimental.stereo_mode_probe", false);
+    const bool on = cfg.getBool("experimental.stereo_mode_probe", preset);
     const int override = cfg.getInt("experimental.stereo_mode_override", -1);
     if (on && !g_installTried) install();
     g_gate.store(on && g_original.load() ? 1 : 0, std::memory_order_release);
